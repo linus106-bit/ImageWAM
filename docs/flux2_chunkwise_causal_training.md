@@ -1,21 +1,21 @@
 # FLUX.2 Chunkwise Causal Training 구현 가이드
 
-이 문서는 DreamZero의 chunkwise causal training 개념을 ImageWAM FLUX.2 학습 경로에 적용할 때 필요한 주요 구현 지점을 정리한다. 기본값은 `K=4`이며, 네 chunk는 서로 독립된 비디오가 아니라 **하나의 연속된 video trajectory를 시간순으로 나눈 구간**이다.
+이 문서는 DreamZero의 chunkwise causal training 개념을 ImageWAM FLUX.2 학습 경로에 적용할 때 필요한 주요 구현 지점을 정리한다. 기본값은 `K=4`, chunk당 action horizon은 기존과 동일한 `16`이며, 네 chunk는 서로 독립된 비디오가 아니라 **하나의 64-action video trajectory를 시간순으로 나눈 구간**이다.
 
 ## 1. 목표 동작
 
-기본 17-frame/16-transition sample은 다음과 같이 구성한다.
+기본 65-frame/64-transition sample은 다음과 같이 구성한다.
 
 ```text
-O0 -- A0 --> O4 -- A1 --> O8 -- A2 --> O12 -- A3 --> O16
+O0 -- A[0:16] --> O16 -- A[16:32] --> O32 -- A[32:48] --> O48 -- A[48:64] --> O64
 ```
 
 | Chunk | Clean observation prefix | Noisy target | Action slice | State anchor |
 |---|---|---|---|---|
-| 0 | `O0` | `O4` | `action[0:4]` | `state[0]` |
-| 1 | `O0, O4` | `O8` | `action[4:8]` | `state[4]` |
-| 2 | `O0, O4, O8` | `O12` | `action[8:12]` | `state[8]` |
-| 3 | `O0, O4, O8, O12` | `O16` | `action[12:16]` | `state[12]` |
+| 0 | `O0` | `O16` | `action[0:16]` | `state[0]` |
+| 1 | `O0, O16` | `O32` | `action[16:32]` | `state[16]` |
+| 2 | `O0, O16, O32` | `O48` | `action[32:48]` | `state[32]` |
+| 3 | `O0, O16, O32, O48` | `O64` | `action[48:64]` | `state[48]` |
 
 Chunk `i`가 끝나면 ground-truth target `O(i+1)`을 다음 chunk의 clean prefix에 추가한다. 따라서 학습은 teacher forcing이며, 생성된 observation을 다시 입력하는 rollout 학습은 이번 범위에 포함하지 않는다.
 
@@ -23,8 +23,9 @@ Chunk `i`가 끝나면 ground-truth target `O(i+1)`을 다음 chunk의 clean pre
 
 ```text
 num_observation_anchors == K + 1
-(num_frames - 1) % K == 0
-action_horizon % K == 0
+actions_per_chunk == 16
+action_horizon == K * actions_per_chunk
+num_frames == action_horizon + 1
 proprio_horizon >= action_horizon
 all ranks yield exactly K losses
 ```
@@ -46,16 +47,19 @@ all ranks yield exactly K losses
 구현:
 
 1. `observation_chunk_count` 옵션을 추가한다.
-2. 활성화되면 다음 식으로 `K+1`개 observation index를 계산한다.
+2. `actions_per_chunk` 옵션을 추가하고 기본값을 기존 action horizon과 같은 `16`으로 둔다.
+3. 활성화되면 다음 식으로 `K+1`개 observation index를 계산한다.
 
    ```python
-   image_obs_indices = [i * (num_frames - 1) // K for i in range(K + 1)]
+   total_action_horizon = K * actions_per_chunk
+   num_frames = total_action_horizon + 1
+   image_obs_indices = [i * actions_per_chunk for i in range(K + 1)]
    ```
 
-3. `num_frames=17, K=4`이면 `[0, 4, 8, 12, 16]`을 반환한다.
-4. 나누어떨어지지 않는 window는 반올림하지 않고 즉시 실패시킨다.
-5. 기존 action/state timestamp와 episode-edge padding 의미는 유지한다.
-6. Processor의 `image_obs_steps`가 `K+1`인지 preprocessing 이전에 설정·검증한다.
+4. `K=4, actions_per_chunk=16`이면 65-frame/64-action window와 `[0, 16, 32, 48, 64]`를 반환한다.
+5. 명시된 `num_frames` 또는 action horizon이 위 식과 다르면 자동 보정하지 않고 즉시 실패시킨다.
+6. 기존 action/state timestamp와 episode-edge padding 의미는 유지한다.
+7. Processor의 `image_obs_steps`가 `K+1`인지 preprocessing 이전에 설정·검증한다.
 
 Dataset 객체가 sample 간 cache를 가지면 안 된다. Distributed sampler가 sample 순서를 바꾸므로 이전 `__getitem__` 결과를 다음 sample history로 재사용할 수 없다.
 
@@ -71,7 +75,9 @@ Dataset 객체가 sample 간 cache를 가지면 안 된다. Distributed sampler�
 각 overlay는 기존 pair config를 상속하고 다음 값을 사용한다.
 
 ```yaml
+num_frames: null  # chunkwise dataset derives K * actions_per_chunk + 1
 observation_chunk_count: ${model.chunkwise_causal.num_chunks}
+actions_per_chunk: ${model.chunkwise_causal.actions_per_chunk}
 ```
 
 FLUX task config만 이 overlay를 선택해야 한다. Non-FLUX task composition은 기존과 동일해야 한다.
@@ -91,11 +97,12 @@ FLUX task config만 이 overlay를 선택해야 한다. Non-FLUX task compositio
 chunkwise_causal:
   enabled: true
   num_chunks: 4
+  actions_per_chunk: 16
   loss_reduction: mean
   cache_type: observation_prefix
 ```
 
-`model.chunkwise_causal.num_chunks`를 resolved `K`의 단일 source of truth로 사용한다. Dataset이 방출한 observation 수와 model `K`가 다르면 forward 전에 실패시킨다.
+`model.chunkwise_causal.num_chunks`와 `actions_per_chunk`를 trajectory geometry의 source of truth로 사용한다. Dataset이 방출한 observation 수, total action horizon 또는 model geometry가 다르면 forward 전에 실패시킨다. `K=1` override는 자동으로 기존 17-frame/16-action endpoint-pair geometry를 복원해야 한다.
 
 Dispatch 규칙:
 
@@ -269,6 +276,8 @@ optimizer.step 한 번
 새 full trainer-state에는 다음 metadata를 저장한다.
 
 - `resolved_chunk_count`
+- `resolved_actions_per_chunk`
+- `resolved_total_action_horizon`
 - `chunkwise_enabled`
 - `cache_type`
 
@@ -277,8 +286,8 @@ Resume 정책:
 | Checkpoint 형태 | 허용 동작 |
 |---|---|
 | Weights-only | 현재 명시적 config의 `K`로 로드 |
-| 새 full-state, 동일 `K`/capability | 정상 resume |
-| 새 full-state, 변경된 `K`/cache type | 실패 |
+| 새 full-state, 동일 `K`/actions-per-chunk/capability | 정상 resume |
+| 새 full-state, 변경된 `K`/actions-per-chunk/cache type | 실패 |
 | Legacy full-state, `K=1` | legacy mode resume |
 | Legacy full-state, `K>1` | optimizer state resume 금지; weights부터 재시작 |
 
@@ -300,7 +309,7 @@ tests/
 
 필수 검증:
 
-1. `17 frames + K=4 -> [0,4,8,12,16]`.
+1. `K=4, actions_per_chunk=16 -> 65 frames, 64 actions, [0,16,32,48,64]`.
 2. Prefix length가 `[1,2,3,4]`로 증가한다.
 3. Future observation/action을 변경해도 earlier chunk loss가 변하지 않는다.
 4. `O0`을 변경하면 later chunk loss가 변한다.
@@ -325,7 +334,7 @@ tests/
 ## 8. 구현 순서 체크리스트
 
 - [ ] 기존 `K=1` behavior를 regression test로 고정한다.
-- [ ] Dataset boundary sampling과 FLUX-only data overlay를 추가한다.
+- [ ] Dataset에 `K × 16` action horizon과 boundary sampling을 추가하고 FLUX-only data overlay를 만든다.
 - [ ] Model config/runtime에 immutable chunkwise config를 연결한다.
 - [ ] Multi-observation input/ID/action/state helper를 구현한다.
 - [ ] Per-example offset 기반 chunk causal mask를 구현한다.
