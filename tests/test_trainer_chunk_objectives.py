@@ -9,6 +9,11 @@ from types import SimpleNamespace
 
 import torch
 
+from imagewam.chunkwise import chunkwise_loss_contribution
+from imagewam.models.backbones.schedulers.scheduler_continuous import (
+    WanContinuousFlowMatchScheduler,
+)
+
 try:
     import accelerate  # noqa: F401
 except ModuleNotFoundError:
@@ -75,6 +80,37 @@ def _chunk_model(losses=(1.0, 2.0, 3.0, 4.0), **overrides):
 
 
 class TrainerChunkObjectivesTest(unittest.TestCase):
+    def test_production_scheduler_batch_one_weights_work_in_training_and_validation(self):
+        parameter = torch.nn.Parameter(torch.tensor([[2.0]]))
+        scheduler = WanContinuousFlowMatchScheduler(num_train_timesteps=8, shift=2.0)
+        scalar_weight = scheduler.training_weight(torch.tensor([4.0]))
+        model = _chunk_model()
+
+        def iter_training_losses(_sample):
+            for _ in range(4):
+                loss, metrics = chunkwise_loss_contribution(
+                    video_squared_error=parameter.square(),
+                    action_squared_error=parameter.square(),
+                    valid_target=torch.tensor([True]),
+                    video_weight=scalar_weight,
+                    action_weight=scalar_weight,
+                    video_denominator=torch.ones(1),
+                    action_denominator=torch.ones(1),
+                    lambda_video=1.0,
+                    lambda_action=1.0,
+                )
+                yield loss, metrics
+
+        model.iter_training_losses = iter_training_losses
+        trainer = _trainer(model)
+
+        validation_loss, _ = trainer._validation_training_loss(model, {})
+        training_loss, _, _, _ = trainer._backward_training_objectives(model, {})
+
+        self.assertTrue(torch.isfinite(validation_loss))
+        self.assertTrue(torch.isfinite(training_loss))
+        self.assertIsNotNone(parameter.grad)
+
     def test_validation_sums_all_chunk_losses_and_metrics(self):
         loss, metrics = _trainer()._validation_training_loss(_chunk_model(), {})
 
@@ -173,6 +209,12 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         payload["resolved_chunk_count"] = 2
         with self.assertRaisesRegex(ValueError, "resolved_chunk_count"):
             trainer._validate_resume_chunkwise_metadata(payload, "mismatch")
+
+        inconsistent = _chunk_model(chunkwise_causal_enabled=False)
+        with self.assertRaisesRegex(ValueError, "Legacy full-state checkpoints can only resume with K=1"):
+            _trainer(inconsistent)._validate_resume_chunkwise_metadata(
+                {"global_step": 1}, "inconsistent-legacy"
+            )
 
     def test_legacy_full_state_is_allowed_for_k1(self):
         model = _chunk_model(

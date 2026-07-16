@@ -588,7 +588,7 @@ class Wan22Trainer:
         metadata_keys = tuple(expected)
         present_keys = [key for key in metadata_keys if key in payload]
         if not present_keys:
-            if expected["chunkwise_enabled"] and expected["resolved_chunk_count"] > 1:
+            if expected["resolved_chunk_count"] > 1:
                 raise ValueError(
                     "Legacy full-state checkpoints can only resume with K=1; "
                     f"current resolved K={expected['resolved_chunk_count']} for {state_dir}. "

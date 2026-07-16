@@ -77,6 +77,7 @@ Dataset 객체가 sample 간 cache를 가지면 안 된다. Distributed sampler�
 ```yaml
 num_frames: null  # chunkwise dataset derives K * actions_per_chunk + 1
 observation_chunk_count: ${model.chunkwise_causal.num_chunks}
+chunkwise_causal_enabled: ${model.chunkwise_causal.enabled}
 actions_per_chunk: ${model.chunkwise_causal.actions_per_chunk}
 ```
 
@@ -102,7 +103,7 @@ chunkwise_causal:
   cache_type: observation_prefix
 ```
 
-`model.chunkwise_causal.num_chunks`와 `actions_per_chunk`를 trajectory geometry의 source of truth로 사용한다. Dataset이 방출한 observation 수, total action horizon 또는 model geometry가 다르면 forward 전에 실패시킨다. `K=1` override는 자동으로 기존 17-frame/16-action endpoint-pair geometry를 복원해야 한다.
+`model.chunkwise_causal.num_chunks`와 `actions_per_chunk`를 trajectory geometry의 source of truth로 사용한다. Dataset이 방출한 observation 수, total action horizon 또는 model geometry가 다르면 forward 전에 실패시킨다. `enabled=false` 또는 명시적 `K=1` override는 model과 FLUX dataset 모두에서 기존 17-frame/16-action endpoint-pair geometry를 복원해야 한다.
 
 Dispatch 규칙:
 
@@ -295,7 +296,7 @@ Resume 정책:
 | 새 full-state, 동일 `K`/actions-per-chunk/capability | 정상 resume |
 | 새 full-state, 변경된 `K`/actions-per-chunk/cache type | 실패 |
 | Legacy full-state, `K=1` | legacy mode resume |
-| Legacy full-state, `K>1` | optimizer state resume 금지; weights부터 재시작 |
+| Metadata-less legacy full-state, resolved `K>1` | optimizer state resume 금지; weights부터 재시작 |
 
 Observation-prefix cache tensor는 checkpoint에 저장하지 않는다.
 

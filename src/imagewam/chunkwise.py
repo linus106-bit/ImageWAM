@@ -56,7 +56,9 @@ def build_chunkwise_causal_mask(
     *,
     text_attention_mask: torch.Tensor,
     observation_token_lengths: Sequence[int],
+    clean_observation_valid: torch.Tensor,
     target_length: int,
+    target_valid: torch.Tensor,
     action_padding_mask: torch.Tensor,
     state_positions: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
@@ -78,9 +80,22 @@ def build_chunkwise_causal_mask(
     if action_padding_mask.shape[0] != batch_size:
         raise ValueError("Text and action masks must have the same batch size.")
     observation_lengths = _validate_lengths(observation_token_lengths, "observation_token_lengths")
+    if clean_observation_valid.ndim != 2 or tuple(clean_observation_valid.shape) != (
+        batch_size,
+        len(observation_lengths),
+    ):
+        raise ValueError(
+            "`clean_observation_valid` must be [B,N], "
+            f"got {tuple(clean_observation_valid.shape)} for B={batch_size}, "
+            f"N={len(observation_lengths)}."
+        )
     target_length = int(target_length)
     if target_length <= 0:
         raise ValueError(f"`target_length` must be positive, got {target_length}.")
+    if target_valid.ndim != 1 or tuple(target_valid.shape) != (batch_size,):
+        raise ValueError(
+            f"`target_valid` must be [B], got {tuple(target_valid.shape)} for B={batch_size}."
+        )
 
     action_length = int(action_padding_mask.shape[1])
     observation_total = sum(observation_lengths)
@@ -127,6 +142,15 @@ def build_chunkwise_causal_mask(
 
     # Padding is a key-side invariant for every query.
     mask[:, :, :text_length] &= text_attention_mask.to(device=device, dtype=torch.bool)[:, None, :]
+    clean_valid = clean_observation_valid.to(device=device, dtype=torch.bool)
+    cursor = observation_start
+    for ordinal, observation_length in enumerate(observation_lengths):
+        end = cursor + observation_length
+        mask[:, :, cursor:end] &= clean_valid[:, ordinal, None, None]
+        cursor = end
+    mask[:, :, target_start:action_start] &= target_valid.to(
+        device=device, dtype=torch.bool
+    )[:, None, None]
     action_valid = ~action_padding_mask.to(device=device, dtype=torch.bool)
     mask[:, :, action_start:total_length] &= action_valid[:, None, :]
     return {"double_joint": mask, "single": mask.clone()}
@@ -145,6 +169,18 @@ def chunkwise_loss_contribution(
     lambda_action: float,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     batch_size = int(video_squared_error.shape[0])
+
+    def _per_batch_weight(weight: torch.Tensor, name: str) -> torch.Tensor:
+        if weight.ndim == 0:
+            return weight.expand(batch_size)
+        if weight.ndim != 1 or int(weight.shape[0]) != batch_size:
+            raise ValueError(
+                f"`{name}` must be scalar or [B], got {tuple(weight.shape)} for B={batch_size}."
+            )
+        return weight
+
+    video_weight = _per_batch_weight(video_weight, "video_weight")
+    action_weight = _per_batch_weight(action_weight, "action_weight")
     tensors = (
         action_squared_error,
         valid_target,
