@@ -58,6 +58,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         qwen_text_cache_format: str = "qwen2_5_vl",
         endpoint_frames_only: bool = False,
         observation_chunk_count: Optional[int] = None,
+        chunkwise_causal_enabled: bool = True,
         actions_per_chunk: int = 16,
         nonidle_filter_path: Optional[str] = None,
         profile_getitem: bool = False,
@@ -76,7 +77,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     ):
         if observation_chunk_count is not None:
             geometry = resolve_chunkwise_geometry(
-                observation_chunk_count,
+                observation_chunk_count if chunkwise_causal_enabled else 1,
                 actions_per_chunk,
                 num_frames=num_frames,
             )

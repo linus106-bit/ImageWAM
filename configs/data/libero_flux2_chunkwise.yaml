@@ -5,5 +5,5 @@ defaults:
 train:
   num_frames: null
   observation_chunk_count: ${model.chunkwise_causal.num_chunks}
+  chunkwise_causal_enabled: ${model.chunkwise_causal.enabled}
   actions_per_chunk: ${model.chunkwise_causal.actions_per_chunk}
-
