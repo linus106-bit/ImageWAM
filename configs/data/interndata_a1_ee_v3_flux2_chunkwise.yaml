@@ -1,0 +1,14 @@
+defaults:
+  - interndata_a1_ee_v3_omnigen2
+  - _self_
+
+train:
+  num_frames: null
+  observation_chunk_count: ${model.chunkwise_causal.num_chunks}
+  actions_per_chunk: ${model.chunkwise_causal.actions_per_chunk}
+
+val:
+  num_frames: null
+  observation_chunk_count: ${model.chunkwise_causal.num_chunks}
+  actions_per_chunk: ${model.chunkwise_causal.actions_per_chunk}
+
