@@ -288,6 +288,9 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         self.assertEqual(len(contributions), 2)
         self.assertEqual(model.video_expert.prefix_lengths, [1, 2])
         self.assertEqual(model.video_expert.prefix_ordinals, [[10.0], [10.0, 11.0]])
+        # Second chunk order is text(2), O0(1), padded O1(1), padded target(1), action(1).
+        self.assertFalse(model.mot.masks[1][:, :, 3].any())
+        self.assertFalse(model.mot.masks[1][:, :, 4].any())
         self.assertGreater(contributions[0][0].item(), 0.0)
         self.assertEqual(contributions[1][0].item(), 0.0)
         self.assertTrue(contributions[1][0].requires_grad)
