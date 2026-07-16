@@ -1,11 +1,20 @@
 import json
+import sys
 import tempfile
+import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+
+try:
+    import accelerate  # noqa: F401
+except ModuleNotFoundError:
+    accelerate_stub = types.ModuleType("accelerate")
+    accelerate_stub.Accelerator = object
+    sys.modules["accelerate"] = accelerate_stub
 
 from imagewam.trainer import Wan22Trainer
 
@@ -46,8 +55,8 @@ def _chunk_model(losses=(1.0, 2.0, 3.0, 4.0), **overrides):
         "resolved_chunk_count": 4,
         "resolved_actions_per_chunk": 16,
         "resolved_total_action_horizon": 64,
-        "chunkwise_enabled": True,
-        "cache_type": "observation_prefix",
+        "chunkwise_causal_enabled": True,
+        "chunkwise_cache_type": "observation_prefix",
         "supports_chunkwise_training_losses": True,
     }
     values.update(overrides)
@@ -86,7 +95,7 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
     def test_inconsistent_or_non_flux_k_greater_than_one_fails_safe(self):
         trainer = _trainer()
         with self.assertRaisesRegex(ValueError, "chunkwise_enabled=True"):
-            trainer._chunkwise_loss_iterator(_chunk_model(chunkwise_enabled=False), {})
+            trainer._chunkwise_loss_iterator(_chunk_model(chunkwise_causal_enabled=False), {})
         with self.assertRaisesRegex(ValueError, "only for the FLUX.2 stack"):
             trainer._chunkwise_loss_iterator(_chunk_model(stack="wan22"), {})
 
@@ -123,7 +132,7 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
             resolved_chunk_count=1,
             resolved_actions_per_chunk=16,
             resolved_total_action_horizon=16,
-            chunkwise_enabled=False,
+            chunkwise_causal_enabled=False,
             supports_chunkwise_training_losses=False,
         )
 
@@ -148,6 +157,13 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
             self.assertIs(payload["supports_chunkwise_training_losses"], True)
             trainer._validate_resume_chunkwise_metadata(payload, tmp_dir)
 
+    def test_canonical_model_metadata_wins_over_legacy_aliases(self):
+        model = _chunk_model(chunkwise_enabled=False, cache_type="legacy-cache")
+        metadata = _trainer(model)._chunkwise_training_metadata()
+
+        self.assertIs(metadata["chunkwise_enabled"], True)
+        self.assertEqual(metadata["cache_type"], "observation_prefix")
+
     def test_resume_rejects_legacy_or_mismatched_chunkwise_full_state(self):
         trainer = _trainer(_chunk_model())
         with self.assertRaisesRegex(ValueError, "Legacy full-state checkpoints can only resume with K=1"):
@@ -163,7 +179,7 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
             resolved_chunk_count=1,
             resolved_actions_per_chunk=16,
             resolved_total_action_horizon=16,
-            chunkwise_enabled=False,
+            chunkwise_causal_enabled=False,
         )
         _trainer(model)._validate_resume_chunkwise_metadata({"global_step": 1}, "legacy-state")
 
