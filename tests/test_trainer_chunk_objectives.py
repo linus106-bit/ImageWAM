@@ -174,6 +174,12 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "resolved_chunk_count"):
             trainer._validate_resume_chunkwise_metadata(payload, "mismatch")
 
+        inconsistent = _chunk_model(chunkwise_causal_enabled=False)
+        with self.assertRaisesRegex(ValueError, "Legacy full-state checkpoints can only resume with K=1"):
+            _trainer(inconsistent)._validate_resume_chunkwise_metadata(
+                {"global_step": 1}, "inconsistent-legacy"
+            )
+
     def test_legacy_full_state_is_allowed_for_k1(self):
         model = _chunk_model(
             resolved_chunk_count=1,

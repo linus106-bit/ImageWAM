@@ -103,6 +103,40 @@ class _Mot(nn.Module):
 
 
 class Flux2ChunkwiseModelTest(unittest.TestCase):
+    def test_disabled_chunkwise_config_resolves_effective_k1_and_capability(self):
+        disabled = ImageWAM(
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            text_dim=2,
+            stack="flux2",
+            chunkwise_causal={"enabled": False, "num_chunks": 4},
+        )
+        enabled = ImageWAM(
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            text_dim=2,
+            stack="flux2",
+            chunkwise_causal={"enabled": True, "num_chunks": 4},
+        )
+        explicit_k1 = ImageWAM(
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            text_dim=2,
+            stack="flux2",
+            chunkwise_causal={"enabled": True, "num_chunks": 1},
+        )
+
+        self.assertEqual(disabled.resolved_chunk_count, 1)
+        self.assertFalse(disabled.supports_chunkwise_training_losses)
+        self.assertTrue(enabled.supports_chunkwise_training_losses)
+        self.assertFalse(explicit_k1.supports_chunkwise_training_losses)
+
     def test_input_builder_accepts_endpoint_observations_and_uses_temporal_boundaries(self):
         model = _bare_model()
         model.resolved_chunk_count = 4
@@ -146,6 +180,9 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
             [0, 1, 2, 3, 4],
         )
         self.assertEqual(built["target_valid"].tolist(), [[True, True, False, True]])
+        self.assertEqual(
+            built["observation_valid"].tolist(), [[True, True, True, False, True]]
+        )
         self.assertEqual(built["video_denominator"].tolist(), [6.0])
         self.assertEqual(built["action_denominator"].tolist(), [63.0])
 
@@ -240,6 +277,7 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
             "action_is_pad": torch.tensor([[False, True]]),
             "action_dim_is_pad": torch.zeros(1, 2, dtype=torch.bool),
             "target_valid": torch.tensor([[True, False]]),
+            "observation_valid": torch.tensor([[True, False, True]]),
             "video_denominator": torch.tensor([2.0]),
             "action_denominator": torch.tensor([2.0]),
         }

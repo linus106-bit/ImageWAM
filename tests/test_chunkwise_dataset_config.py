@@ -37,6 +37,7 @@ class ChunkwiseDatasetConfigTest(unittest.TestCase):
                 text = (root / "configs" / "data" / name).read_text()
                 self.assertIn("num_frames: null", text)
                 self.assertIn("observation_chunk_count: ${model.chunkwise_causal.num_chunks}", text)
+                self.assertIn("chunkwise_causal_enabled: ${model.chunkwise_causal.enabled}", text)
                 self.assertIn("actions_per_chunk: ${model.chunkwise_causal.actions_per_chunk}", text)
 
     def test_flux_task_composition_resolves_k4_and_k1_geometry(self):
@@ -51,6 +52,13 @@ class ChunkwiseDatasetConfigTest(unittest.TestCase):
                 overrides=[
                     "task=libero_flux2_klein_4b_base_imagewam",
                     "model.chunkwise_causal.num_chunks=1",
+                ],
+            )
+            disabled_cfg = compose(
+                config_name="train",
+                overrides=[
+                    "task=libero_flux2_klein_4b_base_imagewam",
+                    "model.chunkwise_causal.enabled=false",
                 ],
             )
             legacy_cfg = compose(
@@ -68,12 +76,29 @@ class ChunkwiseDatasetConfigTest(unittest.TestCase):
             k1_cfg.data.train.actions_per_chunk,
             num_frames=k1_cfg.data.train.num_frames,
         )
+        disabled_geometry = resolve_chunkwise_geometry(
+            (
+                disabled_cfg.data.train.observation_chunk_count
+                if disabled_cfg.data.train.chunkwise_causal_enabled
+                else 1
+            ),
+            disabled_cfg.data.train.actions_per_chunk,
+            num_frames=disabled_cfg.data.train.num_frames,
+        )
         self.assertEqual(
             (default_geometry.num_frames, default_geometry.total_action_horizon, default_geometry.observation_indices),
             (65, 64, (0, 16, 32, 48, 64)),
         )
         self.assertEqual(
             (k1_geometry.num_frames, k1_geometry.total_action_horizon, k1_geometry.observation_indices),
+            (17, 16, (0, 16)),
+        )
+        self.assertEqual(
+            (
+                disabled_geometry.num_frames,
+                disabled_geometry.total_action_horizon,
+                disabled_geometry.observation_indices,
+            ),
             (17, 16, (0, 16)),
         )
         self.assertEqual(legacy_cfg.data.train.num_frames, 17)
