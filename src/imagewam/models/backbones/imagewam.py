@@ -45,6 +45,7 @@ class ImageWAM(torch.nn.Module):
         omnigen2_online_text_cache_compatible: bool = False,
         qwen_context_len: int = 128,
         pack_proprio_after_text: bool = False,
+        chunkwise_causal: Optional[dict[str, Any]] = None,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -96,7 +97,54 @@ class ImageWAM(torch.nn.Module):
         self.qwen_context_len = int(qwen_context_len)
         self.pack_proprio_after_text = bool(pack_proprio_after_text)
 
+        chunkwise = self._resolve_chunkwise_causal_config(self.stack, chunkwise_causal)
+        self.chunkwise_enabled = bool(chunkwise["enabled"])
+        self.resolved_chunk_count = int(chunkwise["num_chunks"])
+        self.resolved_actions_per_chunk = int(chunkwise["actions_per_chunk"])
+        self.resolved_total_action_horizon = (
+            self.resolved_chunk_count * self.resolved_actions_per_chunk
+        )
+        self.chunkwise_loss_reduction = str(chunkwise["loss_reduction"])
+        self.cache_type = str(chunkwise["cache_type"])
+        self.supports_chunkwise_training_losses = self.stack == "flux2"
+
         self.to(self.device)
+
+    @staticmethod
+    def _resolve_chunkwise_causal_config(
+        stack: str,
+        config: Optional[dict[str, Any]],
+    ) -> dict[str, Any]:
+        resolved = {
+            "enabled": False,
+            "num_chunks": 1,
+            "actions_per_chunk": 16,
+            "loss_reduction": "mean",
+            "cache_type": "observation_prefix",
+        }
+        if config is not None:
+            if not isinstance(config, dict):
+                raise ValueError(f"`chunkwise_causal` must be dict-like, got {type(config)}")
+            unknown = set(config) - set(resolved)
+            if unknown:
+                raise ValueError(f"Unknown `chunkwise_causal` keys: {sorted(unknown)}")
+            resolved.update(config)
+        resolved["enabled"] = bool(resolved["enabled"])
+        resolved["num_chunks"] = int(resolved["num_chunks"])
+        resolved["actions_per_chunk"] = int(resolved["actions_per_chunk"])
+        resolved["loss_reduction"] = str(resolved["loss_reduction"])
+        resolved["cache_type"] = str(resolved["cache_type"])
+        if resolved["num_chunks"] < 1:
+            raise ValueError("`chunkwise_causal.num_chunks` must be >= 1.")
+        if resolved["actions_per_chunk"] < 1:
+            raise ValueError("`chunkwise_causal.actions_per_chunk` must be >= 1.")
+        if resolved["loss_reduction"] != "mean":
+            raise ValueError("Only `chunkwise_causal.loss_reduction=mean` is supported.")
+        if resolved["cache_type"] != "observation_prefix":
+            raise ValueError("Only `chunkwise_causal.cache_type=observation_prefix` is supported.")
+        if str(stack) != "flux2" and resolved["enabled"] and resolved["num_chunks"] > 1:
+            raise ValueError("Chunkwise causal training with K > 1 is supported only by the FLUX.2 stack.")
+        return resolved
 
     @classmethod
     def from_wan22_pretrained(
@@ -442,6 +490,7 @@ class ImageWAM(torch.nn.Module):
         flux2_lora_config: Optional[dict[str, Any]] = None,
         qwen3_model_spec: str | None = None,
         qwen_context_len: int = 512,
+        chunkwise_causal: Optional[dict[str, Any]] = None,
     ):
         from safetensors.torch import load_file as load_sft
 
@@ -571,6 +620,7 @@ class ImageWAM(torch.nn.Module):
             stack="flux2",
             qwen_context_len=int(qwen_context_len),
             pack_proprio_after_text=bool(pack_proprio_after_text),
+            chunkwise_causal=chunkwise_causal,
         )
         model.model_paths = {
             "flux2": flux2_model_path,

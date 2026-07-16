@@ -14,6 +14,13 @@ mot_force_flash_attention: false
 pack_proprio_after_text: true
 action_dit_pretrained_path: null
 
+chunkwise_causal:
+  enabled: true
+  num_chunks: 4
+  actions_per_chunk: 16
+  loss_reduction: mean
+  cache_type: observation_prefix
+
 flux2_lora_config:
   enabled: false
   rank: 32

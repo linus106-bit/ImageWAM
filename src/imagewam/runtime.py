@@ -325,6 +325,7 @@ def create_imagewam_flux2_klein(
     mot_force_flash_attention: bool = False,
     pack_proprio_after_text: bool = True,
     flux2_lora_config=None,
+    chunkwise_causal=None,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
 ):
@@ -363,6 +364,12 @@ def create_imagewam_flux2_klein(
         flux2_lora_config = {}
     if not isinstance(flux2_lora_config, dict):
         raise ValueError(f"`flux2_lora_config` must be dict-like, got {type(flux2_lora_config)}")
+    if isinstance(chunkwise_causal, DictConfig):
+        chunkwise_causal = OmegaConf.to_container(chunkwise_causal, resolve=True)
+    if chunkwise_causal is None:
+        chunkwise_causal = {}
+    if not isinstance(chunkwise_causal, dict):
+        raise ValueError(f"`chunkwise_causal` must be dict-like, got {type(chunkwise_causal)}")
     return ImageWAM.from_flux2_klein_pretrained(
         flux2_model_path=flux2_model_path,
         ae_model_path=ae_model_path,
@@ -389,6 +396,7 @@ def create_imagewam_flux2_klein(
         mot_force_flash_attention=bool(mot_force_flash_attention),
         pack_proprio_after_text=bool(pack_proprio_after_text),
         flux2_lora_config=flux2_lora_config,
+        chunkwise_causal=chunkwise_causal,
     )
 
 
