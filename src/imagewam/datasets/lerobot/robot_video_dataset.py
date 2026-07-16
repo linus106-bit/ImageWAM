@@ -14,9 +14,10 @@ from .base_lerobot_dataset import BaseLerobotDataset
 from .utils.normalizer import save_dataset_stats_to_json, load_dataset_stats_from_json
 from ..dataset_utils import ResizeSmallestSideAspectPreserving, CenterCrop, Normalize
 from imagewam.utils.logging_config import get_logger
-from imagewam.utils import misc, pytorch_utils
+from imagewam.utils import misc
 from imagewam.utils.mem_tools import PeriodicTrim
 from accelerate import PartialState
+from imagewam.chunkwise import resolve_chunkwise_geometry
 logger = get_logger(__name__)
 
 # export IMAGEWAM_MEM_TRIM_EVERY=50          
@@ -33,7 +34,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self,
         dataset_dirs,
         shape_meta,
-        num_frames=33,
+        num_frames: Optional[int] = 33,
         video_size=[384, 640],
         camera_key=None,
         processor=None,
@@ -56,6 +57,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         qwen_context_len: int = 128,
         qwen_text_cache_format: str = "qwen2_5_vl",
         endpoint_frames_only: bool = False,
+        observation_chunk_count: Optional[int] = None,
+        actions_per_chunk: int = 16,
         nonidle_filter_path: Optional[str] = None,
         profile_getitem: bool = False,
         condition_frame_augmentation: Optional[dict] = None,
@@ -71,7 +74,22 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         episode_index_filter: Optional[dict] = None,
         slow_getitem_log_sec: float = 0.0,
     ):
-        image_obs_indices = [0, num_frames - 1] if endpoint_frames_only else None
+        if observation_chunk_count is not None:
+            geometry = resolve_chunkwise_geometry(
+                observation_chunk_count,
+                actions_per_chunk,
+                num_frames=num_frames,
+            )
+            num_frames = geometry.num_frames
+            image_obs_indices = list(geometry.observation_indices)
+            endpoint_frames_only = True
+            if processor is not None:
+                processor.num_obs_steps = geometry.num_frames
+                processor.image_obs_steps = len(geometry.observation_indices)
+        else:
+            if num_frames is None:
+                raise ValueError("`num_frames` may be null only when `observation_chunk_count` is set.")
+            image_obs_indices = [0, num_frames - 1] if endpoint_frames_only else None
         self.slow_getitem_log_sec = float(
             os.environ.get("IMAGEWAM_SLOW_GETITEM_LOG_SEC", slow_getitem_log_sec)
         )

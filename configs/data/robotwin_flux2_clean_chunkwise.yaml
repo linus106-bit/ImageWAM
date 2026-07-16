@@ -1,0 +1,13 @@
+defaults:
+  - robotwin_flux2_chunkwise
+  - _self_
+
+train:
+  episode_index_filter:
+    mode: periodic_prefix
+    period: 550
+    keep_first: 50
+
+val:
+  episode_index_filter: ${data.train.episode_index_filter}
+
