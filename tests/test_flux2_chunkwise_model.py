@@ -131,11 +131,32 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
             stack="flux2",
             chunkwise_causal={"enabled": True, "num_chunks": 1},
         )
+        non_flux_disabled = ImageWAM(
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            text_dim=2,
+            stack="wan22",
+            chunkwise_causal={"enabled": False, "num_chunks": 4},
+        )
 
         self.assertEqual(disabled.resolved_chunk_count, 1)
         self.assertFalse(disabled.supports_chunkwise_training_losses)
         self.assertTrue(enabled.supports_chunkwise_training_losses)
         self.assertFalse(explicit_k1.supports_chunkwise_training_losses)
+        self.assertEqual(non_flux_disabled.resolved_chunk_count, 1)
+        self.assertFalse(non_flux_disabled.supports_chunkwise_training_losses)
+        with self.assertRaisesRegex(ValueError, "only by the FLUX.2 stack"):
+            ImageWAM(
+                nn.Identity(),
+                nn.Identity(),
+                nn.Identity(),
+                nn.Identity(),
+                text_dim=2,
+                stack="wan22",
+                chunkwise_causal={"enabled": True, "num_chunks": 4},
+            )
 
     def test_input_builder_accepts_endpoint_observations_and_uses_temporal_boundaries(self):
         model = _bare_model()
