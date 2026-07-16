@@ -88,41 +88,6 @@ class Flux2VideoExpert(nn.Module):
         return repeat(ids, "h w c -> b (h w) c", b=batch_size)
 
     @staticmethod
-    def build_ordered_img_ids(
-        batch_size: int,
-        token_height: int,
-        token_width: int,
-        *,
-        ordinal: int,
-        role: str,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """Build distinct FLUX IDs for an ordered observation boundary.
-
-        Chunkwise training keeps clean prefix observations in the historical
-        positive-time range while noisy targets use the lower target range.
-        The ordinal makes otherwise identical boundary images distinguishable.
-        """
-        if int(ordinal) < 0:
-            raise ValueError(f"`ordinal` must be non-negative, got {ordinal}.")
-        role_key = str(role).strip().lower()
-        if role_key == "clean":
-            time_value = 10.0 + float(ordinal)
-        elif role_key in {"noisy", "target"}:
-            time_value = float(ordinal)
-        else:
-            raise ValueError(f"Unsupported FLUX image-ID role: {role!r}")
-        return Flux2VideoExpert.build_img_ids(
-            batch_size=batch_size,
-            token_height=token_height,
-            token_width=token_width,
-            time_value=time_value,
-            device=device,
-            dtype=dtype,
-        )
-
-    @staticmethod
     def pack_latents(latents: torch.Tensor) -> torch.Tensor:
         if latents.ndim != 4:
             raise ValueError(f"`latents` must be [B,C,H,W], got {tuple(latents.shape)}")
