@@ -103,12 +103,12 @@ class _Mot(nn.Module):
 
 
 class Flux2ChunkwiseModelTest(unittest.TestCase):
-    def test_input_builder_encodes_only_boundaries_and_uses_full_window_denominators(self):
+    def test_input_builder_accepts_endpoint_observations_and_uses_temporal_boundaries(self):
         model = _bare_model()
-        model.resolved_chunk_count = 2
-        model.resolved_actions_per_chunk = 2
-        model.resolved_total_action_horizon = 4
-        model.proprio_encoder = None
+        model.resolved_chunk_count = 4
+        model.resolved_actions_per_chunk = 16
+        model.resolved_total_action_horizon = 64
+        model.proprio_encoder = nn.Identity()
 
         def encode(_self, image, *, time_value):
             del time_value
@@ -124,19 +124,72 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         built = model._build_flux2_chunkwise_inputs(
             {
                 "video": video,
-                "action": torch.zeros(1, 4, 2),
-                "action_is_pad": torch.tensor([[False, False, False, True]]),
+                "action": torch.zeros(1, 64, 2),
+                "action_is_pad": torch.tensor([[False] * 63 + [True]]),
                 "action_dim_is_pad": torch.tensor([[False, True]]),
-                "image_is_pad": torch.tensor([[False, False, False, False, True]]),
+                "image_is_pad": torch.tensor([[False, False, False, True, False]]),
+                "proprio": torch.zeros(1, 64, 2),
             }
         )
 
-        self.assertEqual(built["boundary_indices"], (0, 2, 4))
-        self.assertEqual([entry["tokens"][0, 0, 0].item() for entry in built["observations"]], [0, 2, 4])
-        self.assertEqual([entry["clean_ids"][0, 0, 0].item() for entry in built["observations"]], [10, 11, 12])
-        self.assertEqual([entry["target_ids"][0, 0, 0].item() for entry in built["observations"]], [0, 1, 2])
-        self.assertEqual(built["video_denominator"].tolist(), [2.0])
-        self.assertEqual(built["action_denominator"].tolist(), [3.0])
+        self.assertEqual(built["boundary_indices"], (0, 16, 32, 48, 64))
+        self.assertEqual(
+            [entry["tokens"][0, 0, 0].item() for entry in built["observations"]],
+            [0, 1, 2, 3, 4],
+        )
+        self.assertEqual(
+            [entry["clean_ids"][0, 0, 0].item() for entry in built["observations"]],
+            [10, 11, 12, 13, 14],
+        )
+        self.assertEqual(
+            [entry["target_ids"][0, 0, 0].item() for entry in built["observations"]],
+            [0, 1, 2, 3, 4],
+        )
+        self.assertEqual(built["target_valid"].tolist(), [[True, True, False, True]])
+        self.assertEqual(built["video_denominator"].tolist(), [6.0])
+        self.assertEqual(built["action_denominator"].tolist(), [63.0])
+
+    def test_input_builder_rejects_dense_video_and_geometry_mismatches(self):
+        model = _bare_model()
+        model.resolved_chunk_count = 4
+        model.resolved_actions_per_chunk = 16
+        model.resolved_total_action_horizon = 64
+        model.proprio_encoder = nn.Identity()
+        model._encode_flux2_image_tokens = types.MethodType(
+            lambda _self, image, *, time_value: (
+                torch.zeros(image.shape[0], 1, 2),
+                torch.zeros(image.shape[0], 1, 4),
+            ),
+            model,
+        )
+        model._encode_flux2_text = types.MethodType(
+            lambda _self, _sample: (
+                torch.zeros(1, 2, 2),
+                torch.ones(1, 2, dtype=torch.bool),
+            ),
+            model,
+        )
+
+        valid_sample = {
+            "video": torch.zeros(1, 3, 5, 16, 16),
+            "action": torch.zeros(1, 64, 2),
+            "image_is_pad": torch.zeros(1, 5, dtype=torch.bool),
+            "proprio": torch.zeros(1, 64, 2),
+        }
+
+        invalid_samples = {
+            "dense video": {**valid_sample, "video": torch.zeros(1, 3, 65, 16, 16)},
+            "image padding": {
+                **valid_sample,
+                "image_is_pad": torch.zeros(1, 65, dtype=torch.bool),
+            },
+            "action horizon": {**valid_sample, "action": torch.zeros(1, 63, 2)},
+            "short proprio": {**valid_sample, "proprio": torch.zeros(1, 63, 2)},
+            "long proprio": {**valid_sample, "proprio": torch.zeros(1, 65, 2)},
+        }
+        for name, sample in invalid_samples.items():
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "geometry|image_is_pad"):
+                model._build_flux2_chunkwise_inputs(sample)
 
     def test_state_positions_follow_each_samples_valid_text_length(self):
         model = _bare_model()
