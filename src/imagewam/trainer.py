@@ -1,6 +1,4 @@
-import logging
 import json
-import inspect
 import os
 import re
 import shutil
@@ -17,7 +15,7 @@ from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, Se
 from torch.utils.data import DataLoader
 
 from .utils.fs import ensure_dir
-from .utils.logging_config import get_logger, setup_logging
+from .utils.logging_config import get_logger
 from .utils.pytorch_utils import set_global_seed
 from .utils.samplers import ResumableEpochSampler
 from .utils.video_io import save_mp4
@@ -488,12 +486,17 @@ class Wan22Trainer:
 
     def _chunkwise_loss_iterator(self, model, sample):
         metadata = self._chunkwise_training_metadata(model)
-        chunkwise_active = metadata["chunkwise_enabled"] and metadata["resolved_chunk_count"] > 1
-        if not chunkwise_active:
+        chunk_count = metadata["resolved_chunk_count"]
+        if chunk_count <= 1:
             return None, 1
 
         if str(getattr(model, "stack", "")) != "flux2":
             raise ValueError("Chunkwise training with K>1 is supported only for the FLUX.2 stack.")
+        if not metadata["chunkwise_enabled"]:
+            raise ValueError(
+                "Resolved chunk count K>1 requires `chunkwise_enabled=True`; "
+                f"got K={chunk_count}."
+            )
         if not metadata["supports_chunkwise_training_losses"]:
             raise RuntimeError(
                 "FLUX.2 chunkwise training requires `supports_chunkwise_training_losses=True`."
@@ -503,7 +506,7 @@ class Wan22Trainer:
             raise RuntimeError(
                 "FLUX.2 chunkwise training requires callable `iter_training_losses(sample)`."
             )
-        return iter(iter_training_losses(sample)), metadata["resolved_chunk_count"]
+        return iter(iter_training_losses(sample)), chunk_count
 
     @staticmethod
     def _accumulate_loss_metrics(accumulated: dict, contribution: dict):
@@ -530,6 +533,49 @@ class Wan22Trainer:
                 f"expected {expected_count}, got {objective_count}."
             )
         return total_loss, loss_metrics
+
+    def _backward_training_objectives(self, model, sample):
+        """Run one logical batch as K forwards/backwards without retaining graphs."""
+        objective_iter, expected_count = self._chunkwise_loss_iterator(model, sample)
+        if objective_iter is None:
+            forward_start = time.perf_counter()
+            with self.accelerator.autocast():
+                loss, loss_metrics = model.training_loss(sample)
+            forward_elapsed = time.perf_counter() - forward_start
+
+            backward_start = time.perf_counter()
+            self.accelerator.backward(loss)
+            backward_elapsed = time.perf_counter() - backward_start
+            return loss, loss_metrics, forward_elapsed, backward_elapsed
+
+        total_loss = None
+        loss_metrics = {}
+        objective_count = 0
+        forward_elapsed = 0.0
+        backward_elapsed = 0.0
+        while True:
+            forward_start = time.perf_counter()
+            try:
+                with self.accelerator.autocast():
+                    objective_loss, objective_metrics = next(objective_iter)
+            except StopIteration:
+                break
+            forward_elapsed += time.perf_counter() - forward_start
+            objective_count += 1
+            detached_loss = objective_loss.detach().float()
+            total_loss = detached_loss if total_loss is None else total_loss + detached_loss
+            self._accumulate_loss_metrics(loss_metrics, objective_metrics)
+
+            backward_start = time.perf_counter()
+            self.accelerator.backward(objective_loss)
+            backward_elapsed += time.perf_counter() - backward_start
+
+        if objective_count != expected_count:
+            raise RuntimeError(
+                "`iter_training_losses` yielded an unexpected number of losses: "
+                f"expected {expected_count}, got {objective_count}."
+            )
+        return total_loss, loss_metrics, forward_elapsed, backward_elapsed
 
     def _validate_resume_chunkwise_metadata(self, payload: dict, state_dir: str):
         expected = self._chunkwise_training_metadata()
@@ -1123,8 +1169,6 @@ class Wan22Trainer:
     def train(self):
         self._set_dit_only_train_mode()
 
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-
         if self.max_steps is None:
             raise ValueError("`max_steps` must be set before entering the while-step training loop.")
 
@@ -1161,45 +1205,9 @@ class Wan22Trainer:
                 forward_elapsed = 0.0
                 backward_elapsed = 0.0
 
-                objective_iter, expected_objective_count = self._chunkwise_loss_iterator(
-                    train_model, sample
+                loss, loss_dict, forward_elapsed, backward_elapsed = (
+                    self._backward_training_objectives(train_model, sample)
                 )
-                if objective_iter is not None:
-                    objective_count = 0
-                    while True:
-                        objective_forward_start = time.perf_counter()
-                        try:
-                            with self.accelerator.autocast():
-                                objective_loss, objective_loss_dict = next(objective_iter)
-                        except StopIteration:
-                            break
-                        forward_elapsed += time.perf_counter() - objective_forward_start
-                        objective_count += 1
-                        loss = (
-                            objective_loss.detach().float()
-                            if loss is None
-                            else loss + objective_loss.detach().float()
-                        )
-                        self._accumulate_loss_metrics(loss_dict, objective_loss_dict)
-
-                        objective_backward_start = time.perf_counter()
-                        self.accelerator.backward(objective_loss)
-                        backward_elapsed += time.perf_counter() - objective_backward_start
-
-                    if objective_count != expected_objective_count:
-                        raise RuntimeError(
-                            "`iter_training_losses` yielded an unexpected number of losses: "
-                            f"expected {expected_objective_count}, got {objective_count}."
-                        )
-                else:
-                    forward_start = time.perf_counter()
-                    with self.accelerator.autocast():
-                        loss, loss_dict = train_model.training_loss(sample)
-                    forward_elapsed = time.perf_counter() - forward_start
-
-                    backward_start = time.perf_counter()
-                    self.accelerator.backward(loss)
-                    backward_elapsed = time.perf_counter() - backward_start
 
                 self._rank_timer_sync(timer_active)
                 step_timings["forward"] = forward_elapsed
