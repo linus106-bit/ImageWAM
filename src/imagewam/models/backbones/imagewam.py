@@ -109,7 +109,11 @@ class ImageWAM(torch.nn.Module):
         self.chunkwise_loss_reduction = str(chunkwise["loss_reduction"])
         self.chunkwise_cache_type = str(chunkwise["cache_type"])
         self.cache_type = self.chunkwise_cache_type
-        self.supports_chunkwise_training_losses = self.stack == "flux2"
+        self.supports_chunkwise_training_losses = (
+            self.stack == "flux2"
+            and self.chunkwise_causal_enabled
+            and self.resolved_chunk_count > 1
+        )
 
         self.to(self.device)
 
@@ -145,6 +149,8 @@ class ImageWAM(torch.nn.Module):
             raise ValueError("Only `chunkwise_causal.loss_reduction=mean` is supported.")
         if resolved["cache_type"] != "observation_prefix":
             raise ValueError("Only `chunkwise_causal.cache_type=observation_prefix` is supported.")
+        if not resolved["enabled"]:
+            resolved["num_chunks"] = 1
         if str(stack) != "flux2" and resolved["enabled"] and resolved["num_chunks"] > 1:
             raise ValueError("Chunkwise causal training with K > 1 is supported only by the FLUX.2 stack.")
         return resolved
@@ -2094,6 +2100,7 @@ class ImageWAM(torch.nn.Module):
             "action_is_pad": action_is_pad,
             "action_dim_is_pad": action_dim_is_pad,
             "target_valid": target_valid,
+            "observation_valid": ~image_is_pad,
             "video_denominator": video_denominator,
             "action_denominator": action_denominator,
             "boundary_indices": boundary_indices,
@@ -2703,7 +2710,9 @@ class ImageWAM(torch.nn.Module):
                 observation_token_lengths=tuple(
                     int(entry["tokens"].shape[1]) for entry in clean_prefix
                 ),
+                clean_observation_valid=inputs["observation_valid"][:, : chunk_index + 1],
                 target_length=int(video_pre["target_len"]),
+                target_valid=inputs["target_valid"][:, chunk_index],
                 action_padding_mask=action_is_pad,
                 state_positions=state_positions,
             )
