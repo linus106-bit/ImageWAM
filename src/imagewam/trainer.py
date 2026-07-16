@@ -469,6 +469,12 @@ class Wan22Trainer:
         chunk_count = int(getattr(model, "resolved_chunk_count", 1))
         actions_per_chunk = getattr(model, "resolved_actions_per_chunk", None)
         total_action_horizon = getattr(model, "resolved_total_action_horizon", None)
+        chunkwise_enabled = getattr(model, "chunkwise_causal_enabled", None)
+        if chunkwise_enabled is None:
+            chunkwise_enabled = getattr(model, "chunkwise_enabled", False)
+        cache_type = getattr(model, "chunkwise_cache_type", None)
+        if cache_type is None:
+            cache_type = getattr(model, "cache_type", None)
         return {
             "resolved_chunk_count": chunk_count,
             "resolved_actions_per_chunk": (
@@ -477,8 +483,8 @@ class Wan22Trainer:
             "resolved_total_action_horizon": (
                 None if total_action_horizon is None else int(total_action_horizon)
             ),
-            "chunkwise_enabled": bool(getattr(model, "chunkwise_enabled", False)),
-            "cache_type": getattr(model, "cache_type", None),
+            "chunkwise_enabled": bool(chunkwise_enabled),
+            "cache_type": cache_type,
             "supports_chunkwise_training_losses": bool(
                 getattr(model, "supports_chunkwise_training_losses", False)
             ),
