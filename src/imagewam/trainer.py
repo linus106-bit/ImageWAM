@@ -465,6 +465,101 @@ class Wan22Trainer:
             "Prefer loading weights-only checkpoints before prepare."
         )
 
+    def _chunkwise_training_metadata(self, model=None) -> dict:
+        if model is None:
+            model = self.accelerator.unwrap_model(self.model)
+        chunk_count = int(getattr(model, "resolved_chunk_count", 1))
+        actions_per_chunk = getattr(model, "resolved_actions_per_chunk", None)
+        total_action_horizon = getattr(model, "resolved_total_action_horizon", None)
+        return {
+            "resolved_chunk_count": chunk_count,
+            "resolved_actions_per_chunk": (
+                None if actions_per_chunk is None else int(actions_per_chunk)
+            ),
+            "resolved_total_action_horizon": (
+                None if total_action_horizon is None else int(total_action_horizon)
+            ),
+            "chunkwise_enabled": bool(getattr(model, "chunkwise_enabled", False)),
+            "cache_type": getattr(model, "cache_type", None),
+            "supports_chunkwise_training_losses": bool(
+                getattr(model, "supports_chunkwise_training_losses", False)
+            ),
+        }
+
+    def _chunkwise_loss_iterator(self, model, sample):
+        metadata = self._chunkwise_training_metadata(model)
+        chunkwise_active = metadata["chunkwise_enabled"] and metadata["resolved_chunk_count"] > 1
+        if not chunkwise_active:
+            return None, 1
+
+        if str(getattr(model, "stack", "")) != "flux2":
+            raise ValueError("Chunkwise training with K>1 is supported only for the FLUX.2 stack.")
+        if not metadata["supports_chunkwise_training_losses"]:
+            raise RuntimeError(
+                "FLUX.2 chunkwise training requires `supports_chunkwise_training_losses=True`."
+            )
+        iter_training_losses = getattr(model, "iter_training_losses", None)
+        if not callable(iter_training_losses):
+            raise RuntimeError(
+                "FLUX.2 chunkwise training requires callable `iter_training_losses(sample)`."
+            )
+        return iter(iter_training_losses(sample)), metadata["resolved_chunk_count"]
+
+    @staticmethod
+    def _accumulate_loss_metrics(accumulated: dict, contribution: dict):
+        for key, value in contribution.items():
+            if isinstance(value, torch.Tensor):
+                value = value.detach().float().item()
+            accumulated[key] = accumulated.get(key, 0.0) + float(value)
+
+    def _validation_training_loss(self, model, sample):
+        objective_iter, expected_count = self._chunkwise_loss_iterator(model, sample)
+        if objective_iter is None:
+            return model.training_loss(sample)
+
+        total_loss = None
+        loss_metrics = {}
+        objective_count = 0
+        for objective_loss, objective_metrics in objective_iter:
+            total_loss = objective_loss if total_loss is None else total_loss + objective_loss
+            self._accumulate_loss_metrics(loss_metrics, objective_metrics)
+            objective_count += 1
+        if objective_count != expected_count:
+            raise RuntimeError(
+                "`iter_training_losses` yielded an unexpected number of losses: "
+                f"expected {expected_count}, got {objective_count}."
+            )
+        return total_loss, loss_metrics
+
+    def _validate_resume_chunkwise_metadata(self, payload: dict, state_dir: str):
+        expected = self._chunkwise_training_metadata()
+        metadata_keys = tuple(expected)
+        present_keys = [key for key in metadata_keys if key in payload]
+        if not present_keys:
+            if expected["chunkwise_enabled"] and expected["resolved_chunk_count"] > 1:
+                raise ValueError(
+                    "Legacy full-state checkpoints can only resume with K=1; "
+                    f"current resolved K={expected['resolved_chunk_count']} for {state_dir}. "
+                    "Load weights-only to restart with chunkwise training."
+                )
+            return
+        missing_keys = [key for key in metadata_keys if key not in payload]
+        if missing_keys:
+            raise ValueError(
+                f"Incomplete chunkwise trainer metadata in {state_dir}: missing {missing_keys}."
+            )
+        mismatches = {
+            key: (payload[key], expected[key])
+            for key in metadata_keys
+            if payload[key] != expected[key]
+        }
+        if mismatches:
+            detail = ", ".join(
+                f"{key}=checkpoint:{old!r}/current:{new!r}"
+                for key, (old, new) in mismatches.items()
+            )
+            raise ValueError(f"Chunkwise trainer-state metadata mismatch for {state_dir}: {detail}")
+
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
         logger.info("Setting DiT to train mode and freezing other model components.")
@@ -678,7 +773,7 @@ class Wan22Trainer:
 
                 # 1. training loss
                 with self.accelerator.autocast():
-                    val_loss, _ = model.training_loss(sample)
+                    val_loss, _ = self._validation_training_loss(model, sample)
                     val_loss = val_loss.float().item()
 
                 prompt = sample["prompt"][0]
@@ -938,6 +1033,7 @@ class Wan22Trainer:
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
+            **self._chunkwise_training_metadata(),
         }
         with open(state_file, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2)
@@ -976,11 +1072,12 @@ class Wan22Trainer:
         return {"weights_path": ckpt_path, "state_path": state_path}
 
     def load_training_state(self, state_dir: str):
-        self.accelerator.load_state(input_dir=state_dir)
         state_file = Path(state_dir) / "trainer_state.json"
         if state_file.exists():
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
+            self._validate_resume_chunkwise_metadata(payload, state_dir)
+            self.accelerator.load_state(input_dir=state_dir)
             self.global_step = int(payload["global_step"])
 
             if "epoch" in payload and "batch_in_epoch" in payload:
@@ -1004,6 +1101,9 @@ class Wan22Trainer:
                 )
             self.accelerator.wait_for_everyone()
             return
+
+        self._validate_resume_chunkwise_metadata({}, state_dir)
+        self.accelerator.load_state(input_dir=state_dir)
 
         match = re.search(r"step[_-](\d+)$", str(state_dir).rstrip("/"))
         if match:
@@ -1056,14 +1156,15 @@ class Wan22Trainer:
             with self.accelerator.accumulate(self.model):
                 train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
 
-                iter_training_losses = getattr(train_model, "iter_training_losses", None)
                 loss = None
                 loss_dict = {}
                 forward_elapsed = 0.0
                 backward_elapsed = 0.0
 
-                if callable(iter_training_losses):
-                    objective_iter = iter(iter_training_losses(sample))
+                objective_iter, expected_objective_count = self._chunkwise_loss_iterator(
+                    train_model, sample
+                )
+                if objective_iter is not None:
                     objective_count = 0
                     while True:
                         objective_forward_start = time.perf_counter()
@@ -1079,15 +1180,17 @@ class Wan22Trainer:
                             if loss is None
                             else loss + objective_loss.detach().float()
                         )
-                        for key, value in objective_loss_dict.items():
-                            loss_dict[key] = float(value)
+                        self._accumulate_loss_metrics(loss_dict, objective_loss_dict)
 
                         objective_backward_start = time.perf_counter()
                         self.accelerator.backward(objective_loss)
                         backward_elapsed += time.perf_counter() - objective_backward_start
 
-                    if objective_count <= 0:
-                        raise RuntimeError("`iter_training_losses` yielded no training losses.")
+                    if objective_count != expected_objective_count:
+                        raise RuntimeError(
+                            "`iter_training_losses` yielded an unexpected number of losses: "
+                            f"expected {expected_objective_count}, got {objective_count}."
+                        )
                 else:
                     forward_start = time.perf_counter()
                     with self.accelerator.autocast():
