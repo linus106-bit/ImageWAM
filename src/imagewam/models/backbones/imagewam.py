@@ -1983,7 +1983,7 @@ class ImageWAM(torch.nn.Module):
         num_chunks = int(self.resolved_chunk_count)
         actions_per_chunk = int(self.resolved_actions_per_chunk)
         total_action_horizon = int(self.resolved_total_action_horizon)
-        expected_frames = total_action_horizon + 1
+        expected_frames = num_chunks + 1
 
         video = sample.get("video")
         if not isinstance(video, torch.Tensor) or video.ndim != 5:
@@ -2045,9 +2045,9 @@ class ImageWAM(torch.nn.Module):
 
         boundary_indices = tuple(i * actions_per_chunk for i in range(num_chunks + 1))
         observations = []
-        for ordinal, frame_index in enumerate(boundary_indices):
+        for ordinal in range(num_chunks + 1):
             tokens, base_ids = self._encode_flux2_image_tokens(
-                video[:, :, frame_index], time_value=0.0
+                video[:, :, ordinal], time_value=0.0
             )
             observations.append(
                 {
@@ -2068,18 +2068,19 @@ class ImageWAM(torch.nn.Module):
                 raise ValueError(
                     "FLUX.2 chunkwise training requires `proprio` [B,T,D] when proprio is enabled."
                 )
-            if int(proprio.shape[0]) != int(video.shape[0]) or int(proprio.shape[1]) < total_action_horizon:
+            if (
+                int(proprio.shape[0]) != int(video.shape[0])
+                or int(proprio.shape[1]) != total_action_horizon
+            ):
                 raise ValueError(
                     "FLUX.2 chunkwise proprio geometry mismatch: "
-                    f"got {tuple(proprio.shape)}, need at least [B,{total_action_horizon},D]."
+                    f"got {tuple(proprio.shape)}, expected [B,{total_action_horizon},D]."
                 )
             proprio = proprio.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
 
         action_valid = (~action_is_pad)[:, :, None] & (~action_dim_is_pad)[:, None, :]
         action_denominator = action_valid.flatten(1).sum(dim=1).to(dtype=torch.float32).clamp(min=1.0)
-        target_valid = torch.stack(
-            [~image_is_pad[:, frame_index] for frame_index in boundary_indices[1:]], dim=1
-        )
+        target_valid = ~image_is_pad[:, 1:]
         target_elements = int(observations[0]["tokens"][0].numel())
         video_denominator = (
             target_valid.sum(dim=1).to(dtype=torch.float32) * float(target_elements)
