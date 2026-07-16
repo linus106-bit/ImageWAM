@@ -14,6 +14,7 @@ class _Accelerator:
     def __init__(self, model=None):
         self.model = model
         self.loaded = []
+        self.backward_losses = []
 
     def unwrap_model(self, model):
         return model
@@ -26,6 +27,10 @@ class _Accelerator:
 
     def wait_for_everyone(self):
         pass
+
+    def backward(self, loss):
+        self.backward_losses.append(loss.detach().item())
+        loss.backward()
 
 
 def _trainer(model=None):
@@ -77,6 +82,40 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "expected 4, got 3"):
             trainer._validation_training_loss(_chunk_model(losses=(1.0, 2.0, 3.0)), {})
+
+    def test_inconsistent_or_non_flux_k_greater_than_one_fails_safe(self):
+        trainer = _trainer()
+        with self.assertRaisesRegex(ValueError, "chunkwise_enabled=True"):
+            trainer._chunkwise_loss_iterator(_chunk_model(chunkwise_enabled=False), {})
+        with self.assertRaisesRegex(ValueError, "only for the FLUX.2 stack"):
+            trainer._chunkwise_loss_iterator(_chunk_model(stack="wan22"), {})
+
+    def test_four_chunk_objectives_backward_before_one_optimizer_step(self):
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.SGD([parameter], lr=0.1)
+        optimizer_steps = 0
+
+        model = _chunk_model()
+
+        def iter_training_losses(_sample):
+            for index in range(4):
+                loss = parameter * float(index + 1)
+                yield loss, {"loss_video": loss, "chunk_count": 1}
+
+        model.iter_training_losses = iter_training_losses
+        trainer = _trainer(model)
+        loss, metrics, _, _ = trainer._backward_training_objectives(model, {})
+
+        optimizer.step()
+        optimizer_steps += 1
+        optimizer.zero_grad(set_to_none=True)
+
+        self.assertEqual(trainer.accelerator.backward_losses, [1.0, 2.0, 3.0, 4.0])
+        self.assertEqual(optimizer_steps, 1)
+        self.assertAlmostEqual(loss.item(), 10.0)
+        self.assertAlmostEqual(metrics["loss_video"], 10.0)
+        self.assertAlmostEqual(metrics["chunk_count"], 4.0)
+        self.assertAlmostEqual(parameter.item(), 0.0)
 
     def test_k1_and_non_chunkwise_preserve_training_loss_path(self):
         model = _chunk_model(
