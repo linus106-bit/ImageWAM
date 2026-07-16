@@ -1,0 +1,137 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1400" viewBox="0 0 1400 1400" role="img" aria-labelledby="title desc">
+  <title id="title">FLUX.2 four-chunk causal attention over 64 actions</title>
+  <desc id="desc">Four sequential attention-mask panels, each containing 16 current actions, together covering actions zero through sixty-three.</desc>
+  <defs>
+    <style>
+      .title { font: 700 34px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .subtitle { font: 400 18px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .section { font: 700 20px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .panel-title { font: 700 22px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .label { font: 600 15px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .small { font: 500 13px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4b5563; }
+      .tiny { font: 600 11px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #6b7280; }
+      .check { font: 700 21px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; text-anchor: middle; dominant-baseline: middle; }
+      .blocked { font: 700 19px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #9ca3af; text-anchor: middle; dominant-baseline: middle; }
+    </style>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#111827" flood-opacity="0.10"/>
+    </filter>
+  </defs>
+
+  <rect width="1400" height="1400" fill="#f8fafc"/>
+  <rect x="32" y="28" width="1336" height="1344" rx="26" fill="#ffffff" stroke="#e5e7eb" filter="url(#shadow)"/>
+
+  <text x="72" y="82" class="title">FLUX.2 Chunkwise Causal Attention · 64 Actions</text>
+  <text x="72" y="114" class="subtitle">Four sequential training objectives · 16 current actions per chunk · one optimizer step after all four backwards</text>
+
+  <text x="72" y="160" class="section">Complete action horizon</text>
+  <text x="1328" y="160" class="label" text-anchor="end">16 + 16 + 16 + 16 = 64 actions</text>
+
+  <!-- 64 action tokens, grouped into four chunks -->
+  <g transform="translate(72 180)">
+    <rect x="0" y="0" width="1256" height="70" rx="14" fill="#f9fafb" stroke="#e5e7eb"/>
+    <g fill="#c4b5fd">
+      <rect x="10" y="12" width="18" height="30" rx="4"/><rect x="29" y="12" width="18" height="30" rx="4"/><rect x="48" y="12" width="18" height="30" rx="4"/><rect x="67" y="12" width="18" height="30" rx="4"/>
+      <rect x="86" y="12" width="18" height="30" rx="4"/><rect x="105" y="12" width="18" height="30" rx="4"/><rect x="124" y="12" width="18" height="30" rx="4"/><rect x="143" y="12" width="18" height="30" rx="4"/>
+      <rect x="162" y="12" width="18" height="30" rx="4"/><rect x="181" y="12" width="18" height="30" rx="4"/><rect x="200" y="12" width="18" height="30" rx="4"/><rect x="219" y="12" width="18" height="30" rx="4"/>
+      <rect x="238" y="12" width="18" height="30" rx="4"/><rect x="257" y="12" width="18" height="30" rx="4"/><rect x="276" y="12" width="18" height="30" rx="4"/><rect x="295" y="12" width="18" height="30" rx="4"/>
+    </g>
+    <g fill="#a78bfa">
+      <rect x="324" y="12" width="18" height="30" rx="4"/><rect x="343" y="12" width="18" height="30" rx="4"/><rect x="362" y="12" width="18" height="30" rx="4"/><rect x="381" y="12" width="18" height="30" rx="4"/>
+      <rect x="400" y="12" width="18" height="30" rx="4"/><rect x="419" y="12" width="18" height="30" rx="4"/><rect x="438" y="12" width="18" height="30" rx="4"/><rect x="457" y="12" width="18" height="30" rx="4"/>
+      <rect x="476" y="12" width="18" height="30" rx="4"/><rect x="495" y="12" width="18" height="30" rx="4"/><rect x="514" y="12" width="18" height="30" rx="4"/><rect x="533" y="12" width="18" height="30" rx="4"/>
+      <rect x="552" y="12" width="18" height="30" rx="4"/><rect x="571" y="12" width="18" height="30" rx="4"/><rect x="590" y="12" width="18" height="30" rx="4"/><rect x="609" y="12" width="18" height="30" rx="4"/>
+    </g>
+    <g fill="#8b5cf6">
+      <rect x="638" y="12" width="18" height="30" rx="4"/><rect x="657" y="12" width="18" height="30" rx="4"/><rect x="676" y="12" width="18" height="30" rx="4"/><rect x="695" y="12" width="18" height="30" rx="4"/>
+      <rect x="714" y="12" width="18" height="30" rx="4"/><rect x="733" y="12" width="18" height="30" rx="4"/><rect x="752" y="12" width="18" height="30" rx="4"/><rect x="771" y="12" width="18" height="30" rx="4"/>
+      <rect x="790" y="12" width="18" height="30" rx="4"/><rect x="809" y="12" width="18" height="30" rx="4"/><rect x="828" y="12" width="18" height="30" rx="4"/><rect x="847" y="12" width="18" height="30" rx="4"/>
+      <rect x="866" y="12" width="18" height="30" rx="4"/><rect x="885" y="12" width="18" height="30" rx="4"/><rect x="904" y="12" width="18" height="30" rx="4"/><rect x="923" y="12" width="18" height="30" rx="4"/>
+    </g>
+    <g fill="#7c3aed">
+      <rect x="952" y="12" width="18" height="30" rx="4"/><rect x="971" y="12" width="18" height="30" rx="4"/><rect x="990" y="12" width="18" height="30" rx="4"/><rect x="1009" y="12" width="18" height="30" rx="4"/>
+      <rect x="1028" y="12" width="18" height="30" rx="4"/><rect x="1047" y="12" width="18" height="30" rx="4"/><rect x="1066" y="12" width="18" height="30" rx="4"/><rect x="1085" y="12" width="18" height="30" rx="4"/>
+      <rect x="1104" y="12" width="18" height="30" rx="4"/><rect x="1123" y="12" width="18" height="30" rx="4"/><rect x="1142" y="12" width="18" height="30" rx="4"/><rect x="1161" y="12" width="18" height="30" rx="4"/>
+      <rect x="1180" y="12" width="18" height="30" rx="4"/><rect x="1199" y="12" width="18" height="30" rx="4"/><rect x="1218" y="12" width="18" height="30" rx="4"/><rect x="1237" y="12" width="9" height="30" rx="4"/>
+    </g>
+    <text x="157" y="60" class="tiny" text-anchor="middle">Chunk 0 · A[0:16]</text>
+    <text x="471" y="60" class="tiny" text-anchor="middle">Chunk 1 · A[16:32]</text>
+    <text x="785" y="60" class="tiny" text-anchor="middle">Chunk 2 · A[32:48]</text>
+    <text x="1099" y="60" class="tiny" text-anchor="middle">Chunk 3 · A[48:64]</text>
+  </g>
+
+  <!-- Reusable panel macro expanded four times. Each panel uses the same 3x3 mask relation. -->
+  <g transform="translate(72 286)">
+    <rect width="608" height="470" rx="22" fill="#f9fafb" stroke="#dbe3ee"/>
+    <text x="24" y="40" class="panel-title">Chunk 0</text>
+    <text x="584" y="40" class="label" text-anchor="end">16 actions</text>
+    <rect x="24" y="60" width="170" height="58" rx="12" fill="#dbeafe" stroke="#60a5fa"/><text x="109" y="84" class="label" text-anchor="middle">Observation prefix</text><text x="109" y="105" class="small" text-anchor="middle">O0</text>
+    <rect x="219" y="60" width="170" height="58" rx="12" fill="#ffedd5" stroke="#fb923c"/><text x="304" y="84" class="label" text-anchor="middle">Generated image</text><text x="304" y="105" class="small" text-anchor="middle">noisy O16</text>
+    <rect x="414" y="60" width="170" height="58" rx="12" fill="#f3e8ff" stroke="#c084fc"/><text x="499" y="84" class="label" text-anchor="middle">Current action</text><text x="499" y="105" class="small" text-anchor="middle">A[0:16]</text>
+    <text x="333" y="151" class="tiny" text-anchor="middle">KEY</text>
+    <text x="240" y="174" class="tiny" text-anchor="middle">Obs prefix</text><text x="330" y="174" class="tiny" text-anchor="middle">Image</text><text x="420" y="174" class="tiny" text-anchor="middle">Action</text>
+    <text x="42" y="228" class="label">Observation prefix</text><text x="42" y="298" class="label">Generated image</text><text x="42" y="368" class="label">Current action</text>
+    <g transform="translate(195 185)">
+      <rect x="0" y="0" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="35" class="check">✓</text><rect x="90" y="0" width="90" height="70" fill="#e5e7eb" stroke="#fff" stroke-width="3"/><text x="135" y="35" class="blocked">×</text><rect x="180" y="0" width="90" height="70" fill="#e5e7eb" stroke="#fff" stroke-width="3"/><text x="225" y="35" class="blocked">×</text>
+      <rect x="0" y="70" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="105" class="check">✓</text><rect x="90" y="70" width="90" height="70" fill="#fb923c" stroke="#fff" stroke-width="3"/><text x="135" y="105" class="check">✓</text><rect x="180" y="70" width="90" height="70" fill="#c084fc" stroke="#fff" stroke-width="3"/><text x="225" y="105" class="check">✓</text>
+      <rect x="0" y="140" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="175" class="check">✓</text><rect x="90" y="140" width="90" height="70" fill="#fb923c" stroke="#fff" stroke-width="3"/><text x="135" y="175" class="check">✓</text><rect x="180" y="140" width="90" height="70" fill="#c084fc" stroke="#fff" stroke-width="3"/><text x="225" y="175" class="check">✓</text>
+    </g>
+    <text x="24" y="430" class="small">Future observations/actions are absent from this forward.</text>
+    <text x="24" y="451" class="small">After backward, clean O16 is appended to the next prefix.</text>
+  </g>
+
+  <g transform="translate(720 286)">
+    <rect width="608" height="470" rx="22" fill="#f9fafb" stroke="#dbe3ee"/>
+    <text x="24" y="40" class="panel-title">Chunk 1</text><text x="584" y="40" class="label" text-anchor="end">16 actions</text>
+    <rect x="24" y="60" width="170" height="58" rx="12" fill="#dbeafe" stroke="#60a5fa"/><text x="109" y="84" class="label" text-anchor="middle">Observation prefix</text><text x="109" y="105" class="small" text-anchor="middle">O0, O16</text>
+    <rect x="219" y="60" width="170" height="58" rx="12" fill="#ffedd5" stroke="#fb923c"/><text x="304" y="84" class="label" text-anchor="middle">Generated image</text><text x="304" y="105" class="small" text-anchor="middle">noisy O32</text>
+    <rect x="414" y="60" width="170" height="58" rx="12" fill="#f3e8ff" stroke="#c084fc"/><text x="499" y="84" class="label" text-anchor="middle">Current action</text><text x="499" y="105" class="small" text-anchor="middle">A[16:32]</text>
+    <text x="333" y="151" class="tiny" text-anchor="middle">KEY</text><text x="240" y="174" class="tiny" text-anchor="middle">Obs prefix</text><text x="330" y="174" class="tiny" text-anchor="middle">Image</text><text x="420" y="174" class="tiny" text-anchor="middle">Action</text>
+    <text x="42" y="228" class="label">Observation prefix</text><text x="42" y="298" class="label">Generated image</text><text x="42" y="368" class="label">Current action</text>
+    <g transform="translate(195 185)">
+      <rect x="0" y="0" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="35" class="check">✓</text><rect x="90" y="0" width="90" height="70" fill="#e5e7eb" stroke="#fff" stroke-width="3"/><text x="135" y="35" class="blocked">×</text><rect x="180" y="0" width="90" height="70" fill="#e5e7eb" stroke="#fff" stroke-width="3"/><text x="225" y="35" class="blocked">×</text>
+      <rect x="0" y="70" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="105" class="check">✓</text><rect x="90" y="70" width="90" height="70" fill="#fb923c" stroke="#fff" stroke-width="3"/><text x="135" y="105" class="check">✓</text><rect x="180" y="70" width="90" height="70" fill="#c084fc" stroke="#fff" stroke-width="3"/><text x="225" y="105" class="check">✓</text>
+      <rect x="0" y="140" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="175" class="check">✓</text><rect x="90" y="140" width="90" height="70" fill="#fb923c" stroke="#fff" stroke-width="3"/><text x="135" y="175" class="check">✓</text><rect x="180" y="140" width="90" height="70" fill="#c084fc" stroke="#fff" stroke-width="3"/><text x="225" y="175" class="check">✓</text>
+    </g>
+    <text x="24" y="430" class="small">Only A[16:32] is current; A[0:16] is not cached.</text><text x="24" y="451" class="small">After backward, clean O32 is appended to the next prefix.</text>
+  </g>
+
+  <g transform="translate(72 786)">
+    <rect width="608" height="470" rx="22" fill="#f9fafb" stroke="#dbe3ee"/>
+    <text x="24" y="40" class="panel-title">Chunk 2</text><text x="584" y="40" class="label" text-anchor="end">16 actions</text>
+    <rect x="24" y="60" width="170" height="58" rx="12" fill="#dbeafe" stroke="#60a5fa"/><text x="109" y="84" class="label" text-anchor="middle">Observation prefix</text><text x="109" y="105" class="small" text-anchor="middle">O0, O16, O32</text>
+    <rect x="219" y="60" width="170" height="58" rx="12" fill="#ffedd5" stroke="#fb923c"/><text x="304" y="84" class="label" text-anchor="middle">Generated image</text><text x="304" y="105" class="small" text-anchor="middle">noisy O48</text>
+    <rect x="414" y="60" width="170" height="58" rx="12" fill="#f3e8ff" stroke="#c084fc"/><text x="499" y="84" class="label" text-anchor="middle">Current action</text><text x="499" y="105" class="small" text-anchor="middle">A[32:48]</text>
+    <text x="333" y="151" class="tiny" text-anchor="middle">KEY</text><text x="240" y="174" class="tiny" text-anchor="middle">Obs prefix</text><text x="330" y="174" class="tiny" text-anchor="middle">Image</text><text x="420" y="174" class="tiny" text-anchor="middle">Action</text>
+    <text x="42" y="228" class="label">Observation prefix</text><text x="42" y="298" class="label">Generated image</text><text x="42" y="368" class="label">Current action</text>
+    <g transform="translate(195 185)">
+      <rect x="0" y="0" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="35" class="check">✓</text><rect x="90" y="0" width="90" height="70" fill="#e5e7eb" stroke="#fff" stroke-width="3"/><text x="135" y="35" class="blocked">×</text><rect x="180" y="0" width="90" height="70" fill="#e5e7eb" stroke="#fff" stroke-width="3"/><text x="225" y="35" class="blocked">×</text>
+      <rect x="0" y="70" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="105" class="check">✓</text><rect x="90" y="70" width="90" height="70" fill="#fb923c" stroke="#fff" stroke-width="3"/><text x="135" y="105" class="check">✓</text><rect x="180" y="70" width="90" height="70" fill="#c084fc" stroke="#fff" stroke-width="3"/><text x="225" y="105" class="check">✓</text>
+      <rect x="0" y="140" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="175" class="check">✓</text><rect x="90" y="140" width="90" height="70" fill="#fb923c" stroke="#fff" stroke-width="3"/><text x="135" y="175" class="check">✓</text><rect x="180" y="140" width="90" height="70" fill="#c084fc" stroke="#fff" stroke-width="3"/><text x="225" y="175" class="check">✓</text>
+    </g>
+    <text x="24" y="430" class="small">Only A[32:48] participates in this attention forward.</text><text x="24" y="451" class="small">After backward, clean O48 is appended to the next prefix.</text>
+  </g>
+
+  <g transform="translate(720 786)">
+    <rect width="608" height="470" rx="22" fill="#f9fafb" stroke="#dbe3ee"/>
+    <text x="24" y="40" class="panel-title">Chunk 3</text><text x="584" y="40" class="label" text-anchor="end">16 actions</text>
+    <rect x="24" y="60" width="170" height="58" rx="12" fill="#dbeafe" stroke="#60a5fa"/><text x="109" y="84" class="label" text-anchor="middle">Observation prefix</text><text x="109" y="105" class="small" text-anchor="middle">O0, O16, O32, O48</text>
+    <rect x="219" y="60" width="170" height="58" rx="12" fill="#ffedd5" stroke="#fb923c"/><text x="304" y="84" class="label" text-anchor="middle">Generated image</text><text x="304" y="105" class="small" text-anchor="middle">noisy O64</text>
+    <rect x="414" y="60" width="170" height="58" rx="12" fill="#f3e8ff" stroke="#c084fc"/><text x="499" y="84" class="label" text-anchor="middle">Current action</text><text x="499" y="105" class="small" text-anchor="middle">A[48:64]</text>
+    <text x="333" y="151" class="tiny" text-anchor="middle">KEY</text><text x="240" y="174" class="tiny" text-anchor="middle">Obs prefix</text><text x="330" y="174" class="tiny" text-anchor="middle">Image</text><text x="420" y="174" class="tiny" text-anchor="middle">Action</text>
+    <text x="42" y="228" class="label">Observation prefix</text><text x="42" y="298" class="label">Generated image</text><text x="42" y="368" class="label">Current action</text>
+    <g transform="translate(195 185)">
+      <rect x="0" y="0" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="35" class="check">✓</text><rect x="90" y="0" width="90" height="70" fill="#e5e7eb" stroke="#fff" stroke-width="3"/><text x="135" y="35" class="blocked">×</text><rect x="180" y="0" width="90" height="70" fill="#e5e7eb" stroke="#fff" stroke-width="3"/><text x="225" y="35" class="blocked">×</text>
+      <rect x="0" y="70" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="105" class="check">✓</text><rect x="90" y="70" width="90" height="70" fill="#fb923c" stroke="#fff" stroke-width="3"/><text x="135" y="105" class="check">✓</text><rect x="180" y="70" width="90" height="70" fill="#c084fc" stroke="#fff" stroke-width="3"/><text x="225" y="105" class="check">✓</text>
+      <rect x="0" y="140" width="90" height="70" fill="#60a5fa" stroke="#fff" stroke-width="3"/><text x="45" y="175" class="check">✓</text><rect x="90" y="140" width="90" height="70" fill="#fb923c" stroke="#fff" stroke-width="3"/><text x="135" y="175" class="check">✓</text><rect x="180" y="140" width="90" height="70" fill="#c084fc" stroke="#fff" stroke-width="3"/><text x="225" y="175" class="check">✓</text>
+    </g>
+    <text x="24" y="430" class="small">Only A[48:64] participates in the final attention forward.</text><text x="24" y="451" class="small">All four yielded losses are summed by sequential backward.</text>
+  </g>
+
+  <g transform="translate(72 1288)">
+    <rect x="0" y="0" width="1256" height="54" rx="14" fill="#eef2ff" stroke="#c7d2fe"/>
+    <text x="20" y="23" class="label">Important:</text>
+    <text x="105" y="23" class="small">The four panels collectively cover all 64 actions, but each attention forward contains only its current 16-action block.</text>
+    <text x="20" y="43" class="small">Prior actions are not cached; only clean boundary observations accumulate. Text/state roles are omitted from this simplified view.</text>
+  </g>
+</svg>

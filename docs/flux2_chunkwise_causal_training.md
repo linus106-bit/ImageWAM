@@ -144,6 +144,12 @@ Clean observation ID는 기존 clean/noisy role 범위를 유지하면서 `ids[.
 
 기존 `K=1` mask builder는 수정하지 않고 chunkwise 전용 pure helper를 추가한다. `double_joint`와 `single` mask는 동일한 causal relation을 가져야 하지만 서로 독립된 tensor여야 한다.
 
+### 3.1 Observation / generated image / action 시각화
+
+아래 그림은 네 번의 sequential attention forward 전체를 나타낸다. 각 chunk는 기존과 동일한 16-action block을 가지며, 네 panel이 합쳐서 `A[0:64]` 총 64개 action을 모두 포함한다. 각 개별 forward에는 현재 16개 action만 존재하고 이전 action은 cache하지 않으며, clean boundary observation만 누적된다.
+
+![FLUX.2 chunkwise causal attention mask](figures/flux2_chunkwise_attention_mask.png)
+
 Chunk `i`에서 허용되는 attention 관계:
 
 | Query | 볼 수 있는 Key |
