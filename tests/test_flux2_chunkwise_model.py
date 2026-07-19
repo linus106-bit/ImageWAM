@@ -1,8 +1,13 @@
+import os
+import socket
 import types
 import unittest
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
 
 from imagewam.models.backbones.imagewam import ImageWAM
 
@@ -12,6 +17,9 @@ def _bare_model() -> ImageWAM:
     nn.Module.__init__(model)
     model.device = torch.device("cpu")
     model.torch_dtype = torch.float32
+    model.text_encoder = None
+    model.tokenizer = None
+    model.vae = nn.Identity()
     return model
 
 
@@ -100,6 +108,144 @@ class _Mot(nn.Module):
             },
             "action": embeds_all["action"] * self.scale,
         }
+
+
+def _raise_legacy_training_loss(*_args, **_kwargs):
+    raise AssertionError("chunkwise forward must not call legacy training_loss")
+
+
+def _chunkwise_forward_contract_model(input_scale=1.0):
+    model = _bare_model()
+    model.stack = "flux2"
+    model.chunkwise_causal_enabled = True
+    model.resolved_chunk_count = 2
+    model.resolved_actions_per_chunk = 1
+    model.resolved_total_action_horizon = 2
+    model.proprio_encoder = None
+    model.supports_chunkwise_prepared_forward = True
+    model.loss_lambda_video = 1.0
+    model.loss_lambda_action = 1.0
+    model.train_video_scheduler = _Scheduler()
+    model.train_action_scheduler = _Scheduler()
+    model.video_expert = _VideoExpert()
+    model.action_expert = _ActionExpert()
+    model.mot = _Mot()
+    model.dit = model.mot
+    model.training_loss = _raise_legacy_training_loss
+    observations = [
+        {
+            "tokens": torch.full((1, 1, 2), input_scale * float(index + 1)),
+            "clean_ids": torch.tensor([[[10.0 + index, 0, 0, 0]]]),
+            "target_ids": torch.tensor([[[float(index), 0, 0, 0]]]),
+        }
+        for index in range(3)
+    ]
+    prepared = {
+        "observations": observations,
+        "text_hidden_states": torch.zeros(1, 2, 2),
+        "text_attention_mask": torch.ones(1, 2, dtype=torch.bool),
+        "proprio": None,
+        "action": torch.ones(1, 2, 2) * input_scale,
+        "action_is_pad": torch.tensor([[False, True]]),
+        "action_dim_is_pad": torch.zeros(1, 2, dtype=torch.bool),
+        "target_valid": torch.tensor([[True, False]]),
+        "observation_valid": torch.tensor([[True, False, True]]),
+        "video_denominator": torch.tensor([2.0]),
+        "action_denominator": torch.tensor([2.0]),
+    }
+    model._build_flux2_chunkwise_inputs = lambda *_args, **_kwargs: prepared
+    return model
+
+
+def _free_tcp_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _ddp_chunkwise_forward_worker(rank, world_size, port, queue):
+    try:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        model = _chunkwise_forward_contract_model(input_scale=float(rank + 1))
+        ddp_model = DistributedDataParallel(model)
+        prepared = ddp_model.module.prepare_chunkwise_training_inputs({})
+        loss_value = 0.0
+        chunk_count = 0.0
+        for chunk_index in range(ddp_model.module.resolved_chunk_count):
+            loss, metrics = ddp_model(
+                prepared_chunkwise_inputs=prepared,
+                chunk_index=chunk_index,
+            )
+            loss_value += float(loss.detach().item())
+            chunk_count += float(metrics["chunk_count"])
+            loss.backward()
+        queue.put(
+            {
+                "rank": rank,
+                "loss": loss_value,
+                "grad": float(ddp_model.module.mot.scale.grad.detach().item()),
+                "chunk_count": chunk_count,
+                "masks": len(ddp_model.module.mot.masks),
+            }
+        )
+    except BaseException as exc:
+        queue.put({"rank": rank, "error": repr(exc)})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def _accelerate_chunkwise_forward_worker(rank, world_size, port, queue):
+    try:
+        os.environ.update(
+            {
+                "ACCELERATE_USE_CPU": "true",
+                "LOCAL_RANK": str(rank),
+                "LOCAL_WORLD_SIZE": str(world_size),
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": str(port),
+                "RANK": str(rank),
+                "WORLD_SIZE": str(world_size),
+            }
+        )
+        from accelerate import Accelerator
+
+        accelerator = Accelerator(cpu=True)
+        model = _chunkwise_forward_contract_model(input_scale=float(rank + 1))
+        prepared_model = accelerator.prepare(model)
+        unwrapped_model = accelerator.unwrap_model(prepared_model)
+        prepared = unwrapped_model.prepare_chunkwise_training_inputs({})
+        loss_value = 0.0
+        chunk_count = 0.0
+        for chunk_index in range(unwrapped_model.resolved_chunk_count):
+            loss, metrics = prepared_model(
+                prepared_chunkwise_inputs=prepared,
+                chunk_index=chunk_index,
+            )
+            loss_value += float(loss.detach().item())
+            chunk_count += float(metrics["chunk_count"])
+            accelerator.backward(loss)
+        accelerator.wait_for_everyone()
+        queue.put(
+            {
+                "distributed_type": str(accelerator.distributed_type),
+                "grad": float(unwrapped_model.mot.scale.grad.detach().item()),
+                "loss": loss_value,
+                "masks": len(unwrapped_model.mot.masks),
+                "rank": rank,
+                "chunk_count": chunk_count,
+            }
+        )
+    except BaseException as exc:
+        queue.put({"rank": rank, "error": repr(exc)})
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 class Flux2ChunkwiseModelTest(unittest.TestCase):
@@ -266,7 +412,7 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         self.assertEqual(state_positions.tolist(), [2, 1])
         self.assertEqual(context_mask.sum(dim=1).tolist(), [3, 2])
 
-    def test_iterator_grows_prefix_and_yields_differentiable_zero_anchor(self):
+    def test_prepared_forwards_grow_prefix_and_yield_differentiable_zero_anchor(self):
         model = _bare_model()
         model.stack = "flux2"
         model.chunkwise_causal_enabled = True
@@ -274,6 +420,7 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         model.resolved_actions_per_chunk = 1
         model.resolved_total_action_horizon = 2
         model.proprio_encoder = None
+        model.supports_chunkwise_prepared_forward = True
         model.loss_lambda_video = 1.0
         model.loss_lambda_action = 1.0
         model.train_video_scheduler = _Scheduler()
@@ -304,7 +451,14 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         }
         model._build_flux2_chunkwise_inputs = lambda *_args, **_kwargs: prepared
 
-        contributions = list(model.iter_training_losses({}))
+        prepared_inputs = model.prepare_chunkwise_training_inputs({})
+        contributions = [
+            model(
+                prepared_chunkwise_inputs=prepared_inputs,
+                chunk_index=chunk_index,
+            )
+            for chunk_index in range(model.resolved_chunk_count)
+        ]
 
         self.assertEqual(len(contributions), 2)
         self.assertEqual(model.video_expert.prefix_lengths, [1, 2])
@@ -318,6 +472,9 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         for loss, _metrics in contributions:
             loss.backward()
         self.assertIsNotNone(model.mot.scale.grad)
+
+        with self.assertRaisesRegex(RuntimeError, "bypass distributed wrappers"):
+            list(model.iter_training_losses({}))
 
     def test_k1_iterator_uses_legacy_loss(self):
         model = _bare_model()
@@ -333,6 +490,101 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         self.assertEqual(len(contributions), 1)
         self.assertEqual(contributions[0][0].item(), 6.0)
         self.assertEqual(contributions[0][1], {"legacy": 1.0})
+
+    def test_forward_accepts_prepared_chunkwise_inputs_for_one_chunk(self):
+        model = _chunkwise_forward_contract_model()
+        prepared = model.prepare_chunkwise_training_inputs({})
+
+        loss, metrics = model(prepared_chunkwise_inputs=prepared, chunk_index=0)
+
+        self.assertTrue(loss.requires_grad)
+        self.assertGreater(loss.item(), 0.0)
+        self.assertEqual(metrics["chunk_count"], 1.0)
+        self.assertIn("chunk/0/loss_video", metrics)
+        self.assertEqual(len(model.mot.masks), 1)
+        loss.backward()
+        self.assertIsNotNone(model.mot.scale.grad)
+
+    def test_ddp_forward_synchronizes_chunkwise_gradients_across_cpu_ranks(self):
+        if not dist.is_available():
+            self.skipTest("torch.distributed is unavailable")
+        if not dist.is_gloo_available():
+            self.skipTest("torch.distributed gloo backend is unavailable")
+
+        world_size = 2
+        context = mp.get_context("spawn")
+        queue = context.Queue()
+        port = _free_tcp_port()
+        processes = [
+            context.Process(
+                target=_ddp_chunkwise_forward_worker,
+                args=(rank, world_size, port, queue),
+            )
+            for rank in range(world_size)
+        ]
+        for process in processes:
+            process.start()
+        results = [queue.get(timeout=30) for _ in range(world_size)]
+        for process in processes:
+            process.join(timeout=10)
+            self.assertEqual(process.exitcode, 0)
+
+        errors = [result for result in results if "error" in result]
+        self.assertEqual(errors, [])
+        self.assertEqual({result["rank"] for result in results}, {0, 1})
+        ordered = sorted(results, key=lambda result: result["rank"])
+        self.assertEqual([result["masks"] for result in ordered], [2, 2])
+        self.assertEqual(
+            [result["chunk_count"] for result in ordered],
+            [2.0, 2.0],
+        )
+        grads = [result["grad"] for result in ordered]
+        self.assertNotEqual(results[0]["loss"], results[1]["loss"])
+        self.assertAlmostEqual(grads[0], grads[1], places=6)
+
+    def test_accelerate_forward_synchronizes_chunkwise_gradients_across_cpu_ranks(self):
+        try:
+            import accelerate  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest("accelerate is unavailable")
+        if not dist.is_available():
+            self.skipTest("torch.distributed is unavailable")
+        if not dist.is_gloo_available():
+            self.skipTest("torch.distributed gloo backend is unavailable")
+
+        world_size = 2
+        context = mp.get_context("spawn")
+        queue = context.Queue()
+        port = _free_tcp_port()
+        processes = [
+            context.Process(
+                target=_accelerate_chunkwise_forward_worker,
+                args=(rank, world_size, port, queue),
+            )
+            for rank in range(world_size)
+        ]
+        for process in processes:
+            process.start()
+        results = [queue.get(timeout=30) for _ in range(world_size)]
+        for process in processes:
+            process.join(timeout=10)
+            self.assertEqual(process.exitcode, 0)
+
+        errors = [result for result in results if "error" in result]
+        self.assertEqual(errors, [])
+        self.assertEqual({result["rank"] for result in results}, {0, 1})
+        ordered = sorted(results, key=lambda result: result["rank"])
+        self.assertEqual([result["masks"] for result in ordered], [2, 2])
+        self.assertEqual(
+            [result["chunk_count"] for result in ordered],
+            [2.0, 2.0],
+        )
+        self.assertTrue(
+            all("MULTI_CPU" in result["distributed_type"] for result in ordered)
+        )
+        grads = [result["grad"] for result in ordered]
+        self.assertNotEqual(results[0]["loss"], results[1]["loss"])
+        self.assertAlmostEqual(grads[0], grads[1], places=6)
 
 
 if __name__ == "__main__":

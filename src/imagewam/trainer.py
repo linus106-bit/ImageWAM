@@ -151,6 +151,7 @@ class Wan22Trainer:
         self.model, self.optimizer, self.train_loader, self.scheduler = self.accelerator.prepare(
             self.model, self.optimizer, self.train_loader, self.scheduler
         )
+        self._validate_chunkwise_distributed_contract()
         self.optimizer.zero_grad(set_to_none=True)
         self.wandb_run = None
         self._init_wandb()
@@ -465,7 +466,8 @@ class Wan22Trainer:
 
     def _chunkwise_training_metadata(self, model=None) -> dict:
         if model is None:
-            model = self.accelerator.unwrap_model(self.model)
+            model = self.model
+        model = self.accelerator.unwrap_model(model)
         chunk_count = int(getattr(model, "resolved_chunk_count", 1))
         actions_per_chunk = getattr(model, "resolved_actions_per_chunk", None)
         total_action_horizon = getattr(model, "resolved_total_action_horizon", None)
@@ -490,13 +492,14 @@ class Wan22Trainer:
             ),
         }
 
-    def _chunkwise_loss_iterator(self, model, sample):
+    def _prepare_chunkwise_forward(self, model, sample):
         metadata = self._chunkwise_training_metadata(model)
         chunk_count = metadata["resolved_chunk_count"]
         if chunk_count <= 1:
             return None, 1
 
-        if str(getattr(model, "stack", "")) != "flux2":
+        unwrapped_model = self.accelerator.unwrap_model(model)
+        if str(getattr(unwrapped_model, "stack", "")) != "flux2":
             raise ValueError("Chunkwise training with K>1 is supported only for the FLUX.2 stack.")
         if not metadata["chunkwise_enabled"]:
             raise ValueError(
@@ -507,12 +510,50 @@ class Wan22Trainer:
             raise RuntimeError(
                 "FLUX.2 chunkwise training requires `supports_chunkwise_training_losses=True`."
             )
-        iter_training_losses = getattr(model, "iter_training_losses", None)
-        if not callable(iter_training_losses):
+        if not bool(getattr(unwrapped_model, "supports_chunkwise_prepared_forward", False)):
             raise RuntimeError(
-                "FLUX.2 chunkwise training requires callable `iter_training_losses(sample)`."
+                "FLUX.2 chunkwise training requires `supports_chunkwise_prepared_forward=True`."
             )
-        return iter(iter_training_losses(sample)), chunk_count
+        prepare_inputs = getattr(unwrapped_model, "prepare_chunkwise_training_inputs", None)
+        if not callable(prepare_inputs):
+            raise RuntimeError(
+                "FLUX.2 chunkwise training requires callable "
+                "`prepare_chunkwise_training_inputs(sample)`."
+            )
+        return prepare_inputs(sample), chunk_count
+
+    def _validate_chunkwise_distributed_contract(self):
+        metadata = self._chunkwise_training_metadata(self.model)
+        if metadata["resolved_chunk_count"] <= 1:
+            return
+
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        if not bool(getattr(unwrapped_model, "supports_chunkwise_prepared_forward", False)):
+            raise RuntimeError(
+                "Chunkwise distributed training requires the prepared per-chunk forward contract."
+            )
+        if int(getattr(self.accelerator, "num_processes", 1)) > 1 and self.model is unwrapped_model:
+            raise RuntimeError(
+                "Accelerator.prepare did not wrap the chunkwise model for multi-process training."
+            )
+
+        distributed_type = str(getattr(self.accelerator, "distributed_type", "")).upper()
+        if "FSDP" in distributed_type or "MEGATRON" in distributed_type:
+            raise RuntimeError(
+                "Chunkwise prepared-input training is verified for DDP and DeepSpeed ZeRO stages 0-2; "
+                f"distributed type {distributed_type!r} is not supported."
+            )
+
+        state = getattr(self.accelerator, "state", None)
+        plugin = getattr(state, "deepspeed_plugin", None)
+        deepspeed_config = getattr(plugin, "deepspeed_config", {}) if plugin is not None else {}
+        zero_stage = int(deepspeed_config.get("zero_optimization", {}).get("stage", 0))
+        if zero_stage >= 3:
+            raise RuntimeError(
+                "Chunkwise prepared-input training currently supports DDP and DeepSpeed ZeRO stages 0-2; "
+                f"ZeRO stage {zero_stage} is rejected because frozen preparation outside the engine "
+                "has not been proven safe with partitioned parameters."
+            )
 
     @staticmethod
     def _accumulate_loss_metrics(accumulated: dict, contribution: dict):
@@ -522,32 +563,31 @@ class Wan22Trainer:
             accumulated[key] = accumulated.get(key, 0.0) + float(value)
 
     def _validation_training_loss(self, model, sample):
-        objective_iter, expected_count = self._chunkwise_loss_iterator(model, sample)
-        if objective_iter is None:
-            return model.training_loss(sample)
+        prepared_inputs, expected_count = self._prepare_chunkwise_forward(model, sample)
+        if prepared_inputs is None:
+            return model(sample)
 
         total_loss = None
         loss_metrics = {}
-        objective_count = 0
-        for objective_loss, objective_metrics in objective_iter:
+        for chunk_index in range(expected_count):
+            objective_loss, objective_metrics = model(
+                prepared_chunkwise_inputs=prepared_inputs,
+                chunk_index=chunk_index,
+            )
             total_loss = objective_loss if total_loss is None else total_loss + objective_loss
             self._accumulate_loss_metrics(loss_metrics, objective_metrics)
-            objective_count += 1
-        if objective_count != expected_count:
-            raise RuntimeError(
-                "`iter_training_losses` yielded an unexpected number of losses: "
-                f"expected {expected_count}, got {objective_count}."
-            )
         return total_loss, loss_metrics
 
     def _backward_training_objectives(self, model, sample):
         """Run one logical batch as K forwards/backwards without retaining graphs."""
-        objective_iter, expected_count = self._chunkwise_loss_iterator(model, sample)
-        if objective_iter is None:
+        prepare_start = time.perf_counter()
+        prepared_inputs, expected_count = self._prepare_chunkwise_forward(model, sample)
+        prepare_elapsed = time.perf_counter() - prepare_start
+        if prepared_inputs is None:
             forward_start = time.perf_counter()
             with self.accelerator.autocast():
-                loss, loss_metrics = model.training_loss(sample)
-            forward_elapsed = time.perf_counter() - forward_start
+                loss, loss_metrics = model(sample)
+            forward_elapsed = prepare_elapsed + time.perf_counter() - forward_start
 
             backward_start = time.perf_counter()
             self.accelerator.backward(loss)
@@ -556,18 +596,16 @@ class Wan22Trainer:
 
         total_loss = None
         loss_metrics = {}
-        objective_count = 0
-        forward_elapsed = 0.0
+        forward_elapsed = prepare_elapsed
         backward_elapsed = 0.0
-        while True:
+        for chunk_index in range(expected_count):
             forward_start = time.perf_counter()
-            try:
-                with self.accelerator.autocast():
-                    objective_loss, objective_metrics = next(objective_iter)
-            except StopIteration:
-                break
+            with self.accelerator.autocast():
+                objective_loss, objective_metrics = model(
+                    prepared_chunkwise_inputs=prepared_inputs,
+                    chunk_index=chunk_index,
+                )
             forward_elapsed += time.perf_counter() - forward_start
-            objective_count += 1
             detached_loss = objective_loss.detach().float()
             total_loss = detached_loss if total_loss is None else total_loss + detached_loss
             self._accumulate_loss_metrics(loss_metrics, objective_metrics)
@@ -576,11 +614,6 @@ class Wan22Trainer:
             self.accelerator.backward(objective_loss)
             backward_elapsed += time.perf_counter() - backward_start
 
-        if objective_count != expected_count:
-            raise RuntimeError(
-                "`iter_training_losses` yielded an unexpected number of losses: "
-                f"expected {expected_count}, got {objective_count}."
-            )
         return total_loss, loss_metrics, forward_elapsed, backward_elapsed
 
     def _validate_resume_chunkwise_metadata(self, payload: dict, state_dir: str):
@@ -1204,15 +1237,13 @@ class Wan22Trainer:
             step_timings["data"] = time.perf_counter() - data_start
 
             with self.accelerator.accumulate(self.model):
-                train_model = self.model if hasattr(self.model, "training_loss") else self.accelerator.unwrap_model(self.model)
-
                 loss = None
                 loss_dict = {}
                 forward_elapsed = 0.0
                 backward_elapsed = 0.0
 
                 loss, loss_dict, forward_elapsed, backward_elapsed = (
-                    self._backward_training_objectives(train_model, sample)
+                    self._backward_training_objectives(self.model, sample)
                 )
 
                 self._rank_timer_sync(timer_active)

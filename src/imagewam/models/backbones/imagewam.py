@@ -114,6 +114,7 @@ class ImageWAM(torch.nn.Module):
             and self.chunkwise_causal_enabled
             and self.resolved_chunk_count > 1
         )
+        self.supports_chunkwise_prepared_forward = self.supports_chunkwise_training_losses
 
         self.to(self.device)
 
@@ -1984,6 +1985,24 @@ class ImageWAM(torch.nn.Module):
         ordered[..., 0] = time_value
         return ordered
 
+    @torch.no_grad()
+    def prepare_chunkwise_training_inputs(
+        self,
+        sample,
+        tiled: bool = False,
+    ) -> dict[str, Any]:
+        """Prepare frozen FLUX.2 inputs shared by all chunk forwards.
+
+        Trainable projections and the MoT forward intentionally stay out of this
+        method so every chunk objective can run through the distributed wrapper's
+        canonical ``forward`` entry point.
+        """
+        if not bool(getattr(self, "supports_chunkwise_prepared_forward", False)):
+            raise RuntimeError(
+                "Prepared chunkwise training inputs require enabled FLUX.2 chunkwise training with K>1."
+            )
+        return self._build_flux2_chunkwise_inputs(sample, tiled=tiled)
+
     def _build_flux2_chunkwise_inputs(self, sample, tiled: bool = False) -> dict[str, Any]:
         del tiled
         num_chunks = int(self.resolved_chunk_count)
@@ -2635,137 +2654,143 @@ class ImageWAM(torch.nn.Module):
             and self.chunkwise_causal_enabled
             and self.resolved_chunk_count > 1
         ):
-            yield from self._iter_training_losses_flux2_chunkwise(sample, tiled=tiled)
-            return
+            raise RuntimeError(
+                "Chunkwise iter_training_losses() is disabled because it can bypass distributed "
+                "wrappers. Prepare frozen inputs once, then call the prepared model once per chunk."
+            )
         yield self.training_loss(sample, tiled=tiled)
 
-    def _iter_training_losses_flux2_chunkwise(self, sample, tiled: bool = False):
-        inputs = self._build_flux2_chunkwise_inputs(sample, tiled=tiled)
+    def _training_loss_flux2_chunkwise_prepared(
+        self,
+        inputs: dict[str, Any],
+        chunk_index: int,
+    ):
+        if not bool(getattr(self, "supports_chunkwise_prepared_forward", False)):
+            raise RuntimeError(
+                "Prepared chunkwise forward requires enabled FLUX.2 chunkwise training with K>1."
+            )
+        chunk_index = int(chunk_index)
+        if chunk_index < 0 or chunk_index >= int(self.resolved_chunk_count):
+            raise ValueError(
+                f"`chunk_index` must be in [0, {self.resolved_chunk_count}), got {chunk_index}."
+            )
         observations = inputs["observations"]
         actions_per_chunk = int(self.resolved_actions_per_chunk)
+        target_latent = observations[chunk_index + 1]["tokens"]
+        action_start = chunk_index * actions_per_chunk
+        action_end = action_start + actions_per_chunk
+        action = inputs["action"][:, action_start:action_end]
+        action_is_pad = inputs["action_is_pad"][:, action_start:action_end]
+        context, context_mask, state_positions = self._flux2_chunk_context(inputs, chunk_index)
+        batch_size = int(target_latent.shape[0])
 
-        for chunk_index in range(int(self.resolved_chunk_count)):
-            target_latent = observations[chunk_index + 1]["tokens"]
-            action_start = chunk_index * actions_per_chunk
-            action_end = action_start + actions_per_chunk
-            action = inputs["action"][:, action_start:action_end]
-            action_is_pad = inputs["action_is_pad"][:, action_start:action_end]
-            context, context_mask, state_positions = self._flux2_chunk_context(
-                inputs, chunk_index
-            )
-            batch_size = int(target_latent.shape[0])
+        noise_video = torch.randn_like(target_latent)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=target_latent.dtype,
+        )
+        noisy_latent = self.train_video_scheduler.add_noise(
+            target_latent, noise_video, timestep_video
+        )
+        target_video = self.train_video_scheduler.training_target(
+            target_latent, noise_video, timestep_video
+        )
 
-            noise_video = torch.randn_like(target_latent)
-            timestep_video = self.train_video_scheduler.sample_training_t(
-                batch_size=batch_size,
-                device=self.device,
-                dtype=target_latent.dtype,
-            )
-            noisy_latent = self.train_video_scheduler.add_noise(
-                target_latent, noise_video, timestep_video
-            )
-            target_video = self.train_video_scheduler.training_target(
-                target_latent, noise_video, timestep_video
-            )
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(
+            action, noise_action, timestep_action
+        )
+        target_action = self.train_action_scheduler.training_target(
+            action, noise_action, timestep_action
+        )
 
-            noise_action = torch.randn_like(action)
-            timestep_action = self.train_action_scheduler.sample_training_t(
-                batch_size=batch_size,
-                device=self.device,
-                dtype=action.dtype,
-            )
-            noisy_action = self.train_action_scheduler.add_noise(
-                action, noise_action, timestep_action
-            )
-            target_action = self.train_action_scheduler.training_target(
-                action, noise_action, timestep_action
-            )
+        clean_prefix = observations[: chunk_index + 1]
+        ref_image_latents = torch.cat([entry["tokens"] for entry in clean_prefix], dim=1)
+        ref_img_ids = torch.cat([entry["clean_ids"] for entry in clean_prefix], dim=1)
+        video_pre = self.video_expert.pre_dit(
+            x=noisy_latent,
+            timestep=self._scheduler_timestep_to_unit(
+                timestep_video, self.train_video_scheduler
+            ),
+            context=context,
+            context_mask=context_mask,
+            ref_image_hidden_states=ref_image_latents,
+            target_img_ids=observations[chunk_index + 1]["target_ids"],
+            ref_img_ids=ref_img_ids,
+        )
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=self._scheduler_timestep_to_unit(
+                timestep_action, self.train_action_scheduler
+            ),
+        )
+        attention_mask = build_chunkwise_causal_mask(
+            text_attention_mask=video_pre["text_mask"],
+            observation_token_lengths=tuple(
+                int(entry["tokens"].shape[1]) for entry in clean_prefix
+            ),
+            clean_observation_valid=inputs["observation_valid"][:, : chunk_index + 1],
+            target_length=int(video_pre["target_len"]),
+            target_valid=inputs["target_valid"][:, chunk_index],
+            action_padding_mask=action_is_pad,
+            state_positions=state_positions,
+        )
+        tokens_out = self.mot(
+            embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
+            attention_mask=attention_mask,
+            freqs_all={"video": video_pre["freqs"]},
+            context_all={"video": None, "action": {"ids": action_pre["ids"]}},
+            t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
+        )
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-            clean_prefix = observations[: chunk_index + 1]
-            ref_image_latents = torch.cat(
-                [entry["tokens"] for entry in clean_prefix], dim=1
-            )
-            ref_img_ids = torch.cat(
-                [entry["clean_ids"] for entry in clean_prefix], dim=1
-            )
-            video_pre = self.video_expert.pre_dit(
-                x=noisy_latent,
-                timestep=self._scheduler_timestep_to_unit(
-                    timestep_video, self.train_video_scheduler
-                ),
-                context=context,
-                context_mask=context_mask,
-                ref_image_hidden_states=ref_image_latents,
-                target_img_ids=observations[chunk_index + 1]["target_ids"],
-                ref_img_ids=ref_img_ids,
-            )
-            action_pre = self.action_expert.pre_dit(
-                action_tokens=noisy_action,
-                timestep=self._scheduler_timestep_to_unit(
-                    timestep_action, self.train_action_scheduler
-                ),
-            )
-            attention_mask = build_chunkwise_causal_mask(
-                text_attention_mask=video_pre["text_mask"],
-                observation_token_lengths=tuple(
-                    int(entry["tokens"].shape[1]) for entry in clean_prefix
-                ),
-                clean_observation_valid=inputs["observation_valid"][:, : chunk_index + 1],
-                target_length=int(video_pre["target_len"]),
-                target_valid=inputs["target_valid"][:, chunk_index],
-                action_padding_mask=action_is_pad,
-                state_positions=state_positions,
-            )
-            tokens_out = self.mot(
-                embeds_all={"video": video_pre["tokens"], "action": action_pre["tokens"]},
-                attention_mask=attention_mask,
-                freqs_all={"video": video_pre["freqs"]},
-                context_all={"video": None, "action": {"ids": action_pre["ids"]}},
-                t_mod_all={"video": video_pre["t_mod"], "action": action_pre["t_mod"]},
-            )
-            pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
-            pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
-
-            video_squared_error = F.mse_loss(
-                pred_video.float(), target_video.float(), reduction="none"
-            )
-            action_squared_error = F.mse_loss(
-                pred_action.float(), target_action.float(), reduction="none"
-            )
-            action_valid = (~action_is_pad)[:, :, None] & (
-                ~inputs["action_dim_is_pad"]
-            )[:, None, :]
-            action_squared_error = action_squared_error * action_valid.to(
-                device=action_squared_error.device, dtype=action_squared_error.dtype
-            )
-            video_weight = self.train_video_scheduler.training_weight(timestep_video)
-            action_weight = self.train_action_scheduler.training_weight(timestep_action)
-            loss, components = chunkwise_loss_contribution(
-                video_squared_error=video_squared_error,
-                action_squared_error=action_squared_error,
-                valid_target=inputs["target_valid"][:, chunk_index],
-                video_weight=video_weight,
-                action_weight=action_weight,
-                video_denominator=inputs["video_denominator"],
-                action_denominator=inputs["action_denominator"],
-                lambda_video=self.loss_lambda_video,
-                lambda_action=self.loss_lambda_action,
-            )
-            loss_video = components["loss_video"]
-            loss_action = components["loss_action"]
-            yield loss, {
-                "loss_video": loss_video,
-                "loss_action": loss_action,
-                "chunk_count": 1.0,
-                f"chunk/{chunk_index}/loss_video": loss_video,
-                f"chunk/{chunk_index}/loss_action": loss_action,
-                f"chunk/{chunk_index}/observation_prefix_tokens": float(
-                    ref_image_latents.shape[1]
-                ),
-                f"chunk/{chunk_index}/attention_sequence_length": float(
-                    attention_mask["double_joint"].shape[-1]
-                ),
-            }
+        video_squared_error = F.mse_loss(
+            pred_video.float(), target_video.float(), reduction="none"
+        )
+        action_squared_error = F.mse_loss(
+            pred_action.float(), target_action.float(), reduction="none"
+        )
+        action_valid = (~action_is_pad)[:, :, None] & (
+            ~inputs["action_dim_is_pad"]
+        )[:, None, :]
+        action_squared_error = action_squared_error * action_valid.to(
+            device=action_squared_error.device, dtype=action_squared_error.dtype
+        )
+        video_weight = self.train_video_scheduler.training_weight(timestep_video)
+        action_weight = self.train_action_scheduler.training_weight(timestep_action)
+        loss, components = chunkwise_loss_contribution(
+            video_squared_error=video_squared_error,
+            action_squared_error=action_squared_error,
+            valid_target=inputs["target_valid"][:, chunk_index],
+            video_weight=video_weight,
+            action_weight=action_weight,
+            video_denominator=inputs["video_denominator"],
+            action_denominator=inputs["action_denominator"],
+            lambda_video=self.loss_lambda_video,
+            lambda_action=self.loss_lambda_action,
+        )
+        loss_video = components["loss_video"]
+        loss_action = components["loss_action"]
+        return loss, {
+            "loss_video": loss_video,
+            "loss_action": loss_action,
+            "chunk_count": 1.0,
+            f"chunk/{chunk_index}/loss_video": loss_video,
+            f"chunk/{chunk_index}/loss_action": loss_action,
+            f"chunk/{chunk_index}/observation_prefix_tokens": float(
+                ref_image_latents.shape[1]
+            ),
+            f"chunk/{chunk_index}/attention_sequence_length": float(
+                attention_mask["double_joint"].shape[-1]
+            ),
+        }
 
     def _training_loss_flux2(self, sample, tiled: bool = False):
         inputs = self.build_inputs_flux2(sample, tiled=tiled)
@@ -2959,6 +2984,11 @@ class ImageWAM(torch.nn.Module):
         if self.stack == "dim":
             return self._training_loss_dim(sample, tiled=tiled)
         if self.stack == "flux2":
+            if bool(getattr(self, "supports_chunkwise_prepared_forward", False)):
+                raise RuntimeError(
+                    "Chunkwise FLUX.2 training must use prepare_chunkwise_training_inputs() "
+                    "followed by one wrapped model forward per chunk."
+                )
             return self._training_loss_flux2(sample, tiled=tiled)
         if self.stack == "ovis_u1":
             return self._training_loss_ovis_u1(sample, tiled=tiled)
@@ -4822,5 +4852,25 @@ class ImageWAM(torch.nn.Module):
             if ".lora_A" in name or ".lora_B" in name:
                 param.requires_grad = True
 
-    def forward(self, *args, **kwargs):
-        return self.training_loss(*args, **kwargs)
+    def forward(
+        self,
+        sample=None,
+        *,
+        prepared_chunkwise_inputs: Optional[dict[str, Any]] = None,
+        chunk_index: Optional[int] = None,
+        tiled: bool = False,
+    ):
+        if prepared_chunkwise_inputs is not None:
+            if sample is not None:
+                raise ValueError("`sample` and `prepared_chunkwise_inputs` are mutually exclusive.")
+            if chunk_index is None:
+                raise ValueError("`chunk_index` is required with `prepared_chunkwise_inputs`.")
+            return self._training_loss_flux2_chunkwise_prepared(
+                prepared_chunkwise_inputs,
+                chunk_index,
+            )
+        if chunk_index is not None:
+            raise ValueError("`chunk_index` requires `prepared_chunkwise_inputs`.")
+        if sample is None:
+            raise ValueError("`sample` is required for the standard training forward.")
+        return self.training_loss(sample, tiled=tiled)

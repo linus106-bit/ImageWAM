@@ -29,9 +29,12 @@ class _Accelerator:
         self.model = model
         self.loaded = []
         self.backward_losses = []
+        self.num_processes = 1
+        self.distributed_type = "NO"
+        self.state = SimpleNamespace(deepspeed_plugin=None)
 
     def unwrap_model(self, model):
-        return model
+        return getattr(model, "module", model)
 
     def autocast(self):
         return nullcontext()
@@ -54,6 +57,43 @@ def _trainer(model=None):
     return trainer
 
 
+class _ChunkModel(SimpleNamespace):
+    def prepare_chunkwise_training_inputs(self, sample):
+        self.prepared_samples.append(sample)
+        return {"sample": sample}
+
+    def __call__(
+        self,
+        sample=None,
+        *,
+        prepared_chunkwise_inputs=None,
+        chunk_index=None,
+        tiled=False,
+    ):
+        del tiled
+        if prepared_chunkwise_inputs is not None:
+            if sample is not None:
+                raise ValueError("sample and prepared inputs are mutually exclusive")
+            if chunk_index is None:
+                raise ValueError("chunk_index is required")
+            return self.chunk_loss_fn(int(chunk_index))
+        if chunk_index is not None:
+            raise ValueError("chunk_index requires prepared inputs")
+        return self.training_loss(sample)
+
+
+class _PreparedWrapper:
+    """Minimal DDP/DeepSpeed-shaped wrapper that records outer forward calls."""
+
+    def __init__(self, module):
+        self.module = module
+        self.forward_chunks = []
+
+    def __call__(self, *args, **kwargs):
+        self.forward_chunks.append(kwargs.get("chunk_index"))
+        return self.module(*args, **kwargs)
+
+
 def _chunk_model(losses=(1.0, 2.0, 3.0, 4.0), **overrides):
     values = {
         "stack": "flux2",
@@ -63,20 +103,22 @@ def _chunk_model(losses=(1.0, 2.0, 3.0, 4.0), **overrides):
         "chunkwise_causal_enabled": True,
         "chunkwise_cache_type": "observation_prefix",
         "supports_chunkwise_training_losses": True,
+        "supports_chunkwise_prepared_forward": True,
+        "prepared_samples": [],
     }
     values.update(overrides)
 
-    def iter_training_losses(_sample):
-        for index, value in enumerate(losses):
-            yield torch.tensor(value), {
-                "loss_video": value,
-                "chunk_count": 1,
-                f"chunk/{index}/loss_video": value,
-            }
+    def chunk_loss_fn(index):
+        value = losses[index]
+        return torch.tensor(value), {
+            "loss_video": value,
+            "chunk_count": 1,
+            f"chunk/{index}/loss_video": value,
+        }
 
-    values["iter_training_losses"] = iter_training_losses
+    values["chunk_loss_fn"] = chunk_loss_fn
     values["training_loss"] = lambda _sample: (torch.tensor(99.0), {"legacy": 1.0})
-    return SimpleNamespace(**values)
+    return _ChunkModel(**values)
 
 
 class TrainerChunkObjectivesTest(unittest.TestCase):
@@ -86,22 +128,20 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         scalar_weight = scheduler.training_weight(torch.tensor([4.0]))
         model = _chunk_model()
 
-        def iter_training_losses(_sample):
-            for _ in range(4):
-                loss, metrics = chunkwise_loss_contribution(
-                    video_squared_error=parameter.square(),
-                    action_squared_error=parameter.square(),
-                    valid_target=torch.tensor([True]),
-                    video_weight=scalar_weight,
-                    action_weight=scalar_weight,
-                    video_denominator=torch.ones(1),
-                    action_denominator=torch.ones(1),
-                    lambda_video=1.0,
-                    lambda_action=1.0,
-                )
-                yield loss, metrics
+        def chunk_loss_fn(_index):
+            return chunkwise_loss_contribution(
+                video_squared_error=parameter.square(),
+                action_squared_error=parameter.square(),
+                valid_target=torch.tensor([True]),
+                video_weight=scalar_weight,
+                action_weight=scalar_weight,
+                video_denominator=torch.ones(1),
+                action_denominator=torch.ones(1),
+                lambda_video=1.0,
+                lambda_action=1.0,
+            )
 
-        model.iter_training_losses = iter_training_losses
+        model.chunk_loss_fn = chunk_loss_fn
         trainer = _trainer(model)
 
         validation_loss, _ = trainer._validation_training_loss(model, {})
@@ -119,21 +159,27 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["chunk_count"], 4.0)
         self.assertAlmostEqual(metrics["chunk/3/loss_video"], 4.0)
 
-    def test_chunkwise_iterator_requires_capability_and_exact_k(self):
+    def test_prepare_chunkwise_forward_requires_capabilities_and_prepare_callable(self):
         trainer = _trainer()
         unsupported = _chunk_model(supports_chunkwise_training_losses=False)
         with self.assertRaisesRegex(RuntimeError, "supports_chunkwise_training_losses"):
-            trainer._chunkwise_loss_iterator(unsupported, {})
+            trainer._prepare_chunkwise_forward(unsupported, {})
 
-        with self.assertRaisesRegex(RuntimeError, "expected 4, got 3"):
-            trainer._validation_training_loss(_chunk_model(losses=(1.0, 2.0, 3.0)), {})
+        unsupported_prepared = _chunk_model(supports_chunkwise_prepared_forward=False)
+        with self.assertRaisesRegex(RuntimeError, "supports_chunkwise_prepared_forward"):
+            trainer._prepare_chunkwise_forward(unsupported_prepared, {})
+
+        missing_prepare = _chunk_model()
+        missing_prepare.prepare_chunkwise_training_inputs = None
+        with self.assertRaisesRegex(RuntimeError, "prepare_chunkwise_training_inputs"):
+            trainer._prepare_chunkwise_forward(missing_prepare, {})
 
     def test_inconsistent_or_non_flux_k_greater_than_one_fails_safe(self):
         trainer = _trainer()
         with self.assertRaisesRegex(ValueError, "chunkwise_enabled=True"):
-            trainer._chunkwise_loss_iterator(_chunk_model(chunkwise_causal_enabled=False), {})
+            trainer._prepare_chunkwise_forward(_chunk_model(chunkwise_causal_enabled=False), {})
         with self.assertRaisesRegex(ValueError, "only for the FLUX.2 stack"):
-            trainer._chunkwise_loss_iterator(_chunk_model(stack="wan22"), {})
+            trainer._prepare_chunkwise_forward(_chunk_model(stack="wan22"), {})
 
     def test_four_chunk_objectives_backward_before_one_optimizer_step(self):
         parameter = torch.nn.Parameter(torch.tensor(1.0))
@@ -142,12 +188,11 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
 
         model = _chunk_model()
 
-        def iter_training_losses(_sample):
-            for index in range(4):
-                loss = parameter * float(index + 1)
-                yield loss, {"loss_video": loss, "chunk_count": 1}
+        def chunk_loss_fn(index):
+            loss = parameter * float(index + 1)
+            return loss, {"loss_video": loss, "chunk_count": 1}
 
-        model.iter_training_losses = iter_training_losses
+        model.chunk_loss_fn = chunk_loss_fn
         trainer = _trainer(model)
         loss, metrics, _, _ = trainer._backward_training_objectives(model, {})
 
@@ -161,6 +206,47 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["loss_video"], 10.0)
         self.assertAlmostEqual(metrics["chunk_count"], 4.0)
         self.assertAlmostEqual(parameter.item(), 0.0)
+
+    def test_chunk_objectives_use_outer_prepared_wrapper_for_every_forward(self):
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        module = _chunk_model()
+
+        def chunk_loss_fn(index):
+            loss = parameter * float(index + 1)
+            return loss, {"chunk_count": 1.0}
+
+        module.chunk_loss_fn = chunk_loss_fn
+        wrapped = _PreparedWrapper(module)
+        trainer = _trainer(wrapped)
+
+        trainer._backward_training_objectives(wrapped, {"batch": 1})
+
+        self.assertEqual(module.prepared_samples, [{"batch": 1}])
+        self.assertEqual(wrapped.forward_chunks, [0, 1, 2, 3])
+        self.assertEqual(trainer.accelerator.backward_losses, [1.0, 2.0, 3.0, 4.0])
+
+    def test_distributed_contract_rejects_unwrapped_multi_process_and_zero3(self):
+        module = _chunk_model()
+        trainer = _trainer(module)
+        trainer.accelerator.num_processes = 2
+        with self.assertRaisesRegex(RuntimeError, "did not wrap"):
+            trainer._validate_chunkwise_distributed_contract()
+
+        wrapped = _PreparedWrapper(module)
+        trainer.model = wrapped
+        trainer.accelerator.distributed_type = "MULTI_CPU"
+        trainer._validate_chunkwise_distributed_contract()
+
+        trainer.accelerator.distributed_type = "FSDP"
+        with self.assertRaisesRegex(RuntimeError, "not supported"):
+            trainer._validate_chunkwise_distributed_contract()
+        trainer.accelerator.distributed_type = "DEEPSPEED"
+
+        trainer.accelerator.state.deepspeed_plugin = SimpleNamespace(
+            deepspeed_config={"zero_optimization": {"stage": 3}}
+        )
+        with self.assertRaisesRegex(RuntimeError, "ZeRO stage 3"):
+            trainer._validate_chunkwise_distributed_contract()
 
     def test_k1_and_non_chunkwise_preserve_training_loss_path(self):
         model = _chunk_model(

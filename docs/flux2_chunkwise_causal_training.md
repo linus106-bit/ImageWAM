@@ -177,42 +177,28 @@ Mask 생성 전 다음을 검증한다.
 - 모든 padding key가 모든 query에서 차단되는가
 - sample별 proprio 위치가 실제 packed 위치와 같은가
 
-## 4. Sequential loss iterator
+## 4. Prepared-model chunk forward contract
 
 대상:
 
 - `src/imagewam/models/backbones/imagewam.py`
-- 신규 API 예시: `_iter_training_losses_flux2_chunkwise(sample)`
+- frozen shared preparation: `prepare_chunkwise_training_inputs(sample)`
+- canonical trainable forward: `model(prepared_chunkwise_inputs=prepared, chunk_index=i)`
 
 전체 동작:
 
 ```python
-encoded_obs = encode_all_boundary_observations_once(sample.video)
-denominators = compute_full_window_denominators(sample)
-clean_prefix = [encoded_obs[0]]
+prepared = unwrapped_model.prepare_chunkwise_training_inputs(sample)
 
 for i in range(K):
-    target = add_noise(encoded_obs[i + 1])
-    action = add_action_noise(action_slices[i])
-    state = state_anchors[i]
-
-    inputs = build_chunk_inputs(
-        clean_prefix=clean_prefix,
-        target=target,
-        action=action,
-        state=state,
+    loss_i, metrics_i = prepared_model(
+        prepared_chunkwise_inputs=prepared,
+        chunk_index=i,
     )
-    masks = build_chunkwise_causal_masks(inputs.offsets)
-    predictions = forward_flux2(inputs, masks)
-    loss_i, metrics_i = compute_chunk_contribution(
-        predictions, denominators, chunk_index=i
-    )
-    yield loss_i, metrics_i
-
-    clean_prefix.append(encoded_obs[i + 1])
+    accelerator.backward(loss_i)
 ```
 
-중요한 점은 VAE observation encoding은 재사용하지만, trainable FLUX prefix projection/block graph는 chunk마다 다시 구성한다는 것이다. 그래야 이전 chunk graph를 유지하지 않고도 later-chunk loss가 visible prefix의 trainable parameter까지 gradient를 전달한다.
+`unwrapped_model`에서 실행해도 되는 것은 `torch.no_grad()` frozen VAE/text preparation뿐이다. Trainable FLUX projection, proprio encoder, MoT, loss는 반드시 `Accelerator.prepare`가 반환한 바깥 `prepared_model(...)` 호출 안에서 실행한다. 따라서 DDP/DeepSpeed의 forward lifecycle과 gradient reducer를 우회하지 않는다. `training_loss(sample)`은 K>1에서 legacy endpoint objective로 조용히 fallback하지 않고 실패해야 한다.
 
 ### Exact objective
 
@@ -254,16 +240,20 @@ L = sum_i L_i
 
 ```text
 zero_grad / accumulation context 시작
-  chunk 0 forward -> backward(L0)
-  chunk 1 forward -> backward(L1)
-  chunk 2 forward -> backward(L2)
-  chunk 3 forward -> backward(L3)
+  frozen shared input preparation 한 번
+  prepared_model chunk 0 forward -> backward(L0)
+  prepared_model chunk 1 forward -> backward(L1)
+  prepared_model chunk 2 forward -> backward(L2)
+  prepared_model chunk 3 forward -> backward(L3)
 optimizer.step 한 번
 ```
 
 - `retain_graph=True`를 사용하지 않는다.
 - Outer gradient accumulation 정책은 기존 trainer가 관리한다.
 - 모든 rank가 정확히 `K`번 backward 해야 한다.
+- 모든 trainable chunk forward는 unwrapped module이 아니라 동일한 prepared wrapper를 통과해야 한다.
+- Multi-process인데 `Accelerator.prepare` 결과가 실제 wrapper가 아니면 시작 시 실패한다.
+- Frozen preparation을 engine 밖에서 실행하는 안전성이 검증되지 않은 ZeRO-3는 시작 시 거부한다. 현재 지원 범위는 DDP와 ZeRO 0-2다.
 - 한 chunk가 완전히 padded여도 생략하지 말고 differentiable zero anchor를 yield한다.
 - Metric은 마지막 chunk 값으로 덮어쓰지 않고 모든 chunk를 합산한다.
 - Validation도 persistent cache 없이 모든 `K` contribution을 합산한다.
@@ -324,6 +314,8 @@ tests/
 6. 서로 다른 valid text length를 가진 sample의 state-self-only mask가 정확하다.
 7. Sequential `K` backward gradient가 `backward(sum(L_i))` reference와 일치한다.
 8. 한 rank당 `K` backward, logical batch당 optimizer step 한 번이다.
+   실제 2-process DDP에서 rank별 local loss가 달라도 최종 gradient가 동일해야 한다.
+   동일 검증을 `Accelerator.prepare()`가 만든 wrapper에서도 수행한다.
 9. Fully padded chunk도 zero anchor를 통해 collective 순서를 유지한다.
 10. `K=1` inputs, masks, predictions, loss, gradient, optimizer state, resume가 기존 경로와 일치한다.
 11. Non-FLUX task/config behavior가 변하지 않는다.
