@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 import torch
 
@@ -315,6 +315,174 @@ class PackedBlockSparseMask:
             physical = segment.physical_length
             dense[:, segment.local_start : segment.physical_end, segment.local_start : segment.physical_end] = local[:, :physical, :physical]
         return dense
+
+
+
+_ROLE_ID = {"text": 0, "observation": 1, "target": 2, "action": 3, "padding": 4}
+
+
+def _layout_role_tensor(layout: PackedChunkLayout, *, device: torch.device | str) -> torch.Tensor:
+    return torch.tensor([_ROLE_ID[role] for role in layout.token_role], device=device, dtype=torch.long)
+
+
+def _layout_owner_tensor(layout: PackedChunkLayout, *, device: torch.device | str) -> torch.Tensor:
+    return torch.tensor(layout.pattern_owner, device=device, dtype=torch.long)
+
+
+def _layout_local_index_tensor(layout: PackedChunkLayout, *, device: torch.device | str) -> torch.Tensor:
+    return torch.tensor(layout.local_token_index, device=device, dtype=torch.long)
+
+
+def _build_structural_mask_mod(
+    layout: PackedChunkLayout,
+    *,
+    device: torch.device | str,
+) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+    """Return the batch-independent packed structural predicate for FlexAttention.
+
+    Dynamic batch validity is intentionally excluded. Partial blocks still call this
+    token predicate, so boundaries at block-size +/- 1 remain exact.
+    """
+
+    owner = _layout_owner_tensor(layout, device=device)
+    role = _layout_role_tensor(layout, device=device)
+    local_index = _layout_local_index_tensor(layout, device=device)
+    padding_id = _ROLE_ID["padding"]
+
+    def mask_mod(_batch: torch.Tensor, _head: torch.Tensor, query_index: torch.Tensor, key_index: torch.Tensor) -> torch.Tensor:
+        same_pattern = owner[query_index] == owner[key_index]
+        query_not_padding = role[query_index] != padding_id
+        key_not_padding = role[key_index] != padding_id
+        # Local packed order is already text, observations, target, action.  The
+        # structural predicate over-approximates dynamic validity but preserves
+        # causal local ordering and the current target/action joint group.
+        local_causal = local_index[key_index] <= local_index[query_index]
+        query_current = (role[query_index] == _ROLE_ID["target"]) | (role[query_index] == _ROLE_ID["action"])
+        key_current = (role[key_index] == _ROLE_ID["target"]) | (role[key_index] == _ROLE_ID["action"])
+        current_joint = query_current & key_current
+        return same_pattern & query_not_padding & key_not_padding & (local_causal | current_joint)
+
+    return mask_mod
+
+
+def packed_block_topology_cache_key(
+    layout: PackedChunkLayout,
+    *,
+    device: torch.device | str,
+    block_size: int | tuple[int, int] | None = None,
+) -> tuple[Any, ...]:
+    """Cache key for structural topology only; excludes current-batch tensors."""
+
+    return (str(torch.device(device)), int(block_size or layout.sparse_block_size), layout.signature)
+
+
+def build_packed_block_sparse_mask(
+    *,
+    layout: PackedChunkLayout,
+    query_valid: torch.Tensor,
+    key_valid: torch.Tensor,
+    state_positions: torch.Tensor | None = None,
+    device: torch.device | str | None = None,
+    num_heads: int | None = None,
+    create_block_mask_fn: Callable[..., object] | None = None,
+) -> PackedBlockSparseMask:
+    """Build an ImageWAM-owned packed FlexAttention mask without dense allocation.
+
+    `query_valid`, `key_valid`, and `state_positions` are cloned/detached per forward
+    so cached topology cannot retain mutable current-batch state.
+    """
+
+    if query_valid.ndim != 2 or key_valid.ndim != 2:
+        raise ValueError("`query_valid` and `key_valid` must be [B,L] boolean tensors.")
+    if tuple(query_valid.shape) != tuple(key_valid.shape):
+        raise ValueError("`query_valid` and `key_valid` must have identical [B,L] shapes.")
+    batch_size, seq_len = query_valid.shape
+    if int(seq_len) != int(layout.total_token_count):
+        raise ValueError(
+            "Packed dynamic validity length must match layout.total_token_count: "
+            f"got {seq_len}, expected {layout.total_token_count}."
+        )
+    target_device = torch.device(device) if device is not None else query_valid.device
+    query_snapshot = query_valid.to(device=target_device, dtype=torch.bool).clone().detach()
+    key_snapshot = key_valid.to(device=target_device, dtype=torch.bool).clone().detach()
+    state_snapshot = None
+    if state_positions is not None:
+        if state_positions.ndim != 1 or int(state_positions.shape[0]) != int(batch_size):
+            raise ValueError(f"`state_positions` must be [B], got {tuple(state_positions.shape)}.")
+        state_snapshot = state_positions.to(device=target_device, dtype=torch.long).clone().detach()
+        if bool(((state_snapshot < -1) | (state_snapshot >= seq_len)).any()):
+            raise ValueError("Every packed state position must be -1 or inside the packed sequence.")
+
+    if create_block_mask_fn is None:
+        from torch.nn.attention.flex_attention import create_block_mask as create_block_mask_fn
+
+    block_size = int(layout.sparse_block_size)
+    key = packed_block_topology_cache_key(layout, device=target_device, block_size=block_size)
+
+    def _create() -> object:
+        return create_block_mask_fn(
+            _build_structural_mask_mod(layout, device=target_device),
+            B=None,
+            H=num_heads,
+            Q_LEN=int(seq_len),
+            KV_LEN=int(seq_len),
+            device=str(target_device),
+            BLOCK_SIZE=block_size,
+        )
+
+    sentinel = object()
+    existing = _PACKED_TOPOLOGY_CACHE.get(key, sentinel)
+    block_mask = cache_packed_block_topology(key, _create() if existing is sentinel else existing)
+    return PackedBlockSparseMask(
+        layout=layout,
+        block_mask=block_mask,
+        query_valid=query_snapshot,
+        key_valid=key_snapshot,
+        state_positions=state_snapshot,
+        sparse_block_size=block_size,
+        sparse_alignment=layout.sparse_alignment,
+    )
+
+
+def packed_flex_attention(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: PackedBlockSparseMask,
+    scale: float | None = None,
+    enable_gqa: bool = False,
+    flex_attention_fn: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Call PyTorch FlexAttention through the ImageWAM sparse-mask adapter."""
+
+    if mask.query_valid is None or mask.key_valid is None:
+        raise ValueError("Packed FlexAttention requires per-forward query/key validity tensors.")
+    if flex_attention_fn is None:
+        from torch.nn.attention.flex_attention import flex_attention as flex_attention_fn
+
+    query_valid = mask.query_valid.to(device=query.device, dtype=torch.bool)
+    key_valid = mask.key_valid.to(device=query.device, dtype=torch.bool)
+    state_positions = None
+    if mask.state_positions is not None:
+        state_positions = mask.state_positions.to(device=query.device, dtype=torch.long)
+
+    def score_mod(score: torch.Tensor, batch: torch.Tensor, _head: torch.Tensor, query_index: torch.Tensor, key_index: torch.Tensor) -> torch.Tensor:
+        allowed = query_valid[batch, query_index] & key_valid[batch, key_index]
+        if state_positions is not None:
+            query_is_state = query_index == state_positions[batch]
+            allowed = torch.where(query_is_state, key_index == query_index, allowed)
+        return torch.where(allowed, score, torch.full_like(score, torch.finfo(score.dtype).min))
+
+    return flex_attention_fn(
+        query,
+        key,
+        value,
+        score_mod=score_mod,
+        block_mask=mask.block_mask,
+        scale=scale,
+        enable_gqa=enable_gqa,
+    )
 
 
 def cache_packed_block_topology(key: tuple[Any, ...], value: object) -> object:
