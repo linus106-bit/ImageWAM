@@ -381,7 +381,14 @@ def _build_structural_mask_mod(
         # Conservative fallback for unknown future roles while preserving current local order.
         local_causal = local_index[key_index] <= local_index[query_index]
         allowed_local = text_pair | observation_to_text | observation_causal | current_to_prefix | current_joint | local_causal
-        return same_pattern & query_not_padding & key_not_padding & allowed_local
+        padding_self = (
+            (query_role == padding_id)
+            & (key_role == padding_id)
+            & (local_index[query_index] == local_index[key_index])
+        )
+        return same_pattern & (
+            (query_not_padding & key_not_padding & allowed_local) | padding_self
+        )
 
     return mask_mod
 
@@ -440,6 +447,11 @@ def build_packed_block_sparse_mask(
         state_snapshot = state_positions.to(device=target_device, dtype=torch.long).clone().detach()
         if bool(((state_snapshot < -1) | (state_snapshot >= seq_len)).any()):
             raise ValueError("Every packed state position must be -1 or inside the packed sequence.")
+        state_rows = torch.nonzero(state_snapshot >= 0, as_tuple=False).flatten()
+        if state_rows.numel() > 0:
+            state_columns = state_snapshot[state_rows]
+            key_snapshot[state_rows, state_columns] = False
+            query_snapshot[state_rows, state_columns] = True
 
     if create_block_mask_fn is None:
         from torch.nn.attention.flex_attention import create_block_mask as create_block_mask_fn
@@ -499,15 +511,31 @@ def packed_flex_attention(
     state_positions = None
     if mask.state_positions is not None:
         state_positions = mask.state_positions.to(device=query.device, dtype=torch.long)
+    query_roles = _layout_role_tensor(mask.layout, device=query.device)
+    current_query_roles = (query_roles == _ROLE_ID["target"]) | (
+        query_roles == _ROLE_ID["action"]
+    )
 
     def score_mod(score: torch.Tensor, batch: torch.Tensor, _head: torch.Tensor, query_index: torch.Tensor, key_index: torch.Tensor) -> torch.Tensor:
-        allowed = query_valid[batch, query_index] & key_valid[batch, key_index]
+        query_is_valid = query_valid[batch, query_index]
+        allowed = query_is_valid & key_valid[batch, key_index]
         if state_positions is not None:
-            query_is_state = query_index == state_positions[batch]
+            state_position = state_positions[batch]
+            has_state = state_position >= 0
+            query_is_state = has_state & (query_index == state_position)
+            current_to_state = (
+                has_state
+                & query_is_valid
+                & current_query_roles[query_index]
+                & (key_index == state_position)
+            )
+            allowed = allowed | current_to_state
             allowed = torch.where(query_is_state, key_index == query_index, allowed)
-        return torch.where(allowed, score, torch.full_like(score, torch.finfo(score.dtype).min))
+        # Give invalid query rows a finite dummy self-edge, then zero them after the kernel.
+        allowed = allowed | ((~query_is_valid) & (key_index == query_index))
+        return torch.where(allowed, score, torch.full_like(score, float("-inf")))
 
-    return flex_attention_fn(
+    output = flex_attention_fn(
         query,
         key,
         value,
@@ -516,6 +544,8 @@ def packed_flex_attention(
         scale=scale,
         enable_gqa=enable_gqa,
     )
+    output_valid = query_valid[:, None, :, None]
+    return torch.where(output_valid, output, torch.zeros_like(output))
 
 
 def cache_packed_block_topology(key: tuple[Any, ...], value: object) -> object:

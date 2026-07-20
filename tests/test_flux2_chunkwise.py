@@ -12,6 +12,7 @@ from imagewam.chunkwise import (
     cache_packed_block_topology,
     chunkwise_loss_contribution,
     clear_packed_topology_cache,
+    packed_flex_attention,
     packed_topology_cache_size,
     resolve_chunkwise_geometry,
 )
@@ -237,6 +238,38 @@ class Flux2ChunkwiseTest(unittest.TestCase):
         mask_mod = calls[0]["mask_mod"]
         self.assertTrue(bool(mask_mod(torch.tensor(0), torch.tensor(0), torch.tensor(6), torch.tensor(7))))
 
+        aligned_layout = build_packed_chunk_layout(
+            chunks=(
+                {
+                    "text_length": 2,
+                    "observation_token_lengths": (1,),
+                    "target_length": 1,
+                    "action_length": 1,
+                },
+            ),
+            sparse_block_size=4,
+            sparse_alignment="segment",
+        )
+        aligned_calls = []
+        build_packed_block_sparse_mask(
+            layout=aligned_layout,
+            query_valid=torch.tensor([[True, True, True, True, True, False, False, False]]),
+            key_valid=torch.tensor([[True, True, True, True, True, False, False, False]]),
+            device="cpu",
+            create_block_mask_fn=lambda mask_mod, **_kwargs: aligned_calls.append(mask_mod),
+        )
+        padding_index = aligned_layout.segments[0].padding_range[0]
+        self.assertTrue(
+            bool(
+                aligned_calls[0](
+                    torch.tensor(0),
+                    torch.tensor(0),
+                    torch.tensor(padding_index),
+                    torch.tensor(padding_index),
+                )
+            )
+        )
+
     def test_packed_sparse_mask_snapshots_dynamic_tensors_and_reuses_structural_topology(self):
         clear_packed_topology_cache()
         layout = build_packed_chunk_layout(
@@ -266,7 +299,7 @@ class Flux2ChunkwiseTest(unittest.TestCase):
             device="cpu",
             create_block_mask_fn=fake_create,
         )
-        query_valid[:, 1] = False
+        query_valid[:, 4] = False
         key_valid[:, 2] = False
         second = build_packed_block_sparse_mask(
             layout=layout,
@@ -281,12 +314,72 @@ class Flux2ChunkwiseTest(unittest.TestCase):
         self.assertEqual(len(create_calls), 1)
         self.assertEqual(first.signature, second.signature)
         self.assertNotEqual(first.query_valid.data_ptr(), query_valid.data_ptr())
-        self.assertTrue(first.query_valid[0, 1])
-        self.assertFalse(second.query_valid[0, 1])
+        self.assertTrue(first.query_valid[0, 4])
+        self.assertFalse(second.query_valid[0, 4])
         self.assertTrue(first.key_valid[0, 2])
         self.assertFalse(second.key_valid[0, 2])
         self.assertEqual(first.state_positions.tolist(), [0])
         self.assertEqual(second.state_positions.tolist(), [1])
+        self.assertFalse(first.key_valid[0, 0])
+        self.assertFalse(second.key_valid[0, 1])
+        self.assertTrue(first.query_valid[0, 0])
+        self.assertTrue(second.query_valid[0, 1])
+        clear_packed_topology_cache()
+
+    def test_packed_flex_state_edges_match_causal_contract_and_invalid_queries_zero(self):
+        clear_packed_topology_cache()
+        layout = build_packed_chunk_layout(
+            chunks=(
+                {
+                    "text_length": 2,
+                    "observation_token_lengths": (1,),
+                    "target_length": 1,
+                    "action_length": 1,
+                },
+            ),
+            sparse_block_size=4,
+        )
+        sparse = build_packed_block_sparse_mask(
+            layout=layout,
+            query_valid=torch.tensor([[True, False, True, True, True]]),
+            key_valid=torch.ones(1, layout.total_token_count, dtype=torch.bool),
+            state_positions=torch.tensor([0]),
+            device="cpu",
+            create_block_mask_fn=lambda *_args, **_kwargs: object(),
+        )
+        captured = {}
+
+        def fake_flex(query, _key, _value, *, score_mod, **_kwargs):
+            captured["score_mod"] = score_mod
+            return torch.ones_like(query)
+
+        query = torch.randn(1, 1, layout.total_token_count, 2)
+        output = packed_flex_attention(
+            query=query,
+            key=query,
+            value=query,
+            mask=sparse,
+            flex_attention_fn=fake_flex,
+        )
+        score_mod = captured["score_mod"]
+
+        def modified(query_index, key_index):
+            return score_mod(
+                torch.tensor(1.0),
+                torch.tensor(0),
+                torch.tensor(0),
+                torch.tensor(query_index),
+                torch.tensor(key_index),
+            )
+
+        self.assertTrue(torch.isfinite(modified(0, 0)))  # state query self-edge
+        self.assertTrue(torch.isneginf(modified(0, 1)))
+        self.assertTrue(torch.isneginf(modified(2, 0)))  # observation cannot read state
+        self.assertTrue(torch.isfinite(modified(3, 0)))  # current target can read state
+        self.assertTrue(torch.isfinite(modified(4, 0)))  # current action can read state
+        self.assertTrue(torch.isfinite(modified(1, 1)))  # invalid-query dummy edge
+        self.assertTrue(torch.equal(output[:, :, 1], torch.zeros_like(output[:, :, 1])))
+        self.assertTrue(torch.equal(output[:, :, 0], torch.ones_like(output[:, :, 0])))
         clear_packed_topology_cache()
 
     def test_packed_topology_cache_separates_head_count(self):

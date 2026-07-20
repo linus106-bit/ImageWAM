@@ -1,5 +1,6 @@
 import os
 import time
+from dataclasses import fields, is_dataclass
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -3050,15 +3051,54 @@ class ImageWAM(torch.nn.Module):
 
     @staticmethod
     def _cat_packed_payload(payloads: Sequence[Any]) -> Any:
+        if not payloads:
+            raise ValueError("Packed payload concatenation requires at least one payload.")
         first = payloads[0]
         if isinstance(first, torch.Tensor):
             return torch.cat([payload for payload in payloads], dim=0)
         if isinstance(first, dict):
+            expected_keys = tuple(first)
+            if any(tuple(payload) != expected_keys for payload in payloads):
+                raise ValueError("Packed payload dictionaries must have identical ordered keys.")
             return {
                 key: ImageWAM._cat_packed_payload([payload[key] for payload in payloads])
                 for key in first
             }
-        return first
+        if is_dataclass(first) and not isinstance(first, type):
+            if any(type(payload) is not type(first) for payload in payloads):
+                raise TypeError("Packed dataclass payloads must have identical types.")
+            return type(first)(
+                **{
+                    field.name: ImageWAM._cat_packed_payload(
+                        [getattr(payload, field.name) for payload in payloads]
+                    )
+                    for field in fields(first)
+                }
+            )
+        if isinstance(first, tuple) and hasattr(first, "_fields"):
+            if any(type(payload) is not type(first) for payload in payloads):
+                raise TypeError("Packed namedtuple payloads must have identical types.")
+            return type(first)(
+                *(
+                    ImageWAM._cat_packed_payload([payload[index] for payload in payloads])
+                    for index in range(len(first))
+                )
+            )
+        if isinstance(first, (list, tuple)):
+            if any(type(payload) is not type(first) or len(payload) != len(first) for payload in payloads):
+                raise TypeError("Packed sequence payloads must have identical types and lengths.")
+            values = [
+                ImageWAM._cat_packed_payload([payload[index] for payload in payloads])
+                for index in range(len(first))
+            ]
+            return values if isinstance(first, list) else tuple(values)
+        if first is None:
+            if any(payload is not None for payload in payloads):
+                raise TypeError("Packed optional payloads must all be None or all carry values.")
+            return None
+        if isinstance(first, (bool, int, float, str)) and all(payload == first for payload in payloads):
+            return first
+        raise TypeError(f"Unsupported packed payload leaf type: {type(first).__name__}.")
 
     def _training_loss_flux2_chunkwise_packed(self, inputs: dict[str, Any]):
         if not bool(getattr(self, "supports_chunkwise_prepared_forward", False)):

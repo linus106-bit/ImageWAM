@@ -2,6 +2,8 @@ import os
 import socket
 import types
 import unittest
+from collections import namedtuple
+from dataclasses import dataclass
 from unittest import mock
 
 import torch
@@ -294,6 +296,40 @@ def _accelerate_chunkwise_forward_worker(rank, world_size, port, queue):
 
 
 class Flux2ChunkwiseModelTest(unittest.TestCase):
+    def test_packed_payload_concatenates_nested_modulation_structures(self):
+        modulation = namedtuple("Modulation", ("shift", "scale", "gate"))
+
+        @dataclass(frozen=True)
+        class Container:
+            primary: object
+            auxiliary: object
+
+        payloads = []
+        for value in (1.0, 2.0):
+            tensor = torch.full((2, 1), value)
+            payloads.append(
+                {
+                    "tuple": (
+                        modulation(tensor, tensor + 1, tensor + 2),
+                        modulation(tensor + 3, tensor + 4, tensor + 5),
+                    ),
+                    "list": [tensor + 6],
+                    "dataclass": Container(primary=tensor + 7, auxiliary=None),
+                }
+            )
+
+        packed = ImageWAM._cat_packed_payload(payloads)
+
+        self.assertEqual(tuple(packed["tuple"][0].shift.shape), (4, 1))
+        self.assertEqual(packed["tuple"][0].shift[:, 0].tolist(), [1.0, 1.0, 2.0, 2.0])
+        self.assertEqual(packed["tuple"][1].gate[:, 0].tolist(), [6.0, 6.0, 7.0, 7.0])
+        self.assertEqual(packed["list"][0][:, 0].tolist(), [7.0, 7.0, 8.0, 8.0])
+        self.assertEqual(packed["dataclass"].primary[:, 0].tolist(), [8.0, 8.0, 9.0, 9.0])
+        self.assertIsNone(packed["dataclass"].auxiliary)
+
+        with self.assertRaisesRegex(TypeError, "optional payloads"):
+            ImageWAM._cat_packed_payload([None, torch.ones(1)])
+
     def test_disabled_chunkwise_config_resolves_effective_k1_and_capability(self):
         disabled = ImageWAM(
             nn.Identity(),

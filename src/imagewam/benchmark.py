@@ -272,6 +272,12 @@ def validate_result(result: Mapping[str, Any]) -> None:
         "distributed",
     )
     protocol = result["protocol"]
+    _require_fields(protocol, ("warmup_steps", "measured_steps", "seed"), "protocol")
+    _require_fields(
+        result["correctness"],
+        ("passed", "finite_loss", "finite_gradients", "oom"),
+        "correctness",
+    )
     BenchmarkProtocol(
         warmup_steps=int(protocol["warmup_steps"]),
         measured_steps=int(protocol["measured_steps"]),
@@ -326,6 +332,10 @@ def _validate_candidate(candidate: str) -> None:
 
 
 def _validate_completed_metrics(result: Mapping[str, Any]) -> None:
+    if result["source"]["dirty"] is not False:
+        raise ValueError("Completed benchmark results require a clean git source.")
+    if result["runtime"]["cuda_available"] is not True:
+        raise ValueError("Completed benchmark results require CUDA runtime evidence.")
     correctness = result["correctness"]
     if correctness.get("oom") is not False:
         raise ValueError("Completed benchmark results must report oom=false.")
@@ -343,12 +353,96 @@ def _validate_completed_metrics(result: Mapping[str, Any]) -> None:
         raise ValueError("Completed benchmark results require finite positive timing/throughput.")
     if not _is_finite_positive(metrics["peak_memory_bytes"]["allocated"]):
         raise ValueError("Completed benchmark results require finite positive GPU memory.")
-    if not metrics.get("per_rank"):
-        raise ValueError("Completed benchmark results require raw per-rank measurements.")
+    if not _is_finite_nonnegative(metrics["compile_warmup_seconds"]):
+        raise ValueError("Completed benchmark results require finite compile/warm-up time.")
+    packed = metrics["packed"]
+    for key in ("tokens", "theoretical_dense_token_pairs", "visited_sparse_blocks"):
+        if not _is_finite_nonnegative(packed[key]):
+            raise ValueError(f"Completed benchmark results require finite packed.{key}.")
+    if not _is_unit_interval(packed["block_sparsity"]):
+        raise ValueError("Completed benchmark block_sparsity must be in [0,1].")
+    _validate_call_counts(result)
+    _validate_rank_aggregates(result)
+
+
+def _validate_call_counts(result: Mapping[str, Any]) -> None:
+    counts = result["metrics"]["call_counts"]
+    if any(not isinstance(counts[key], int) or counts[key] < 0 for key in CALL_COUNT_KEYS):
+        raise ValueError("Completed benchmark call counts must be non-negative integers.")
+    measured_steps = int(result["protocol"]["measured_steps"])
+    chunks = int(result["task"]["num_chunks"])
+    multiplier = 1 if result["candidate"] == "packed_flex" else chunks
+    expected = measured_steps * multiplier
+    for key in ("outer_model", "mot", "backward"):
+        if counts[key] != expected:
+            raise ValueError(
+                f"Completed {result['candidate']} result requires {key}={expected}, "
+                f"got {counts[key]}."
+            )
+    if result["candidate"] == "packed_flex" and counts["flex_attention"] <= 0:
+        raise ValueError("Completed packed_flex results require FlexAttention calls.")
+    if result["candidate"] == "sequential" and counts["flex_attention"] != 0:
+        raise ValueError("Sequential benchmark results must not report FlexAttention calls.")
+
+
+def _validate_rank_aggregates(result: Mapping[str, Any]) -> None:
+    metrics = result["metrics"]
+    per_rank = metrics["per_rank"]
+    world_size = int(result["distributed"]["world_size"])
+    measured_steps = int(result["protocol"]["measured_steps"])
+    if not isinstance(per_rank, list) or len(per_rank) != world_size:
+        raise ValueError("Completed benchmark results require one raw record per rank.")
+    ranks = [int(rank["rank"]) for rank in per_rank]
+    if sorted(ranks) != list(range(world_size)):
+        raise ValueError("Per-rank benchmark records must have unique contiguous rank ids.")
+    for rank in per_rank:
+        for phase in ("forward_seconds", "backward_seconds", "total_step_seconds"):
+            if len(rank[phase]) != measured_steps:
+                raise ValueError(
+                    f"Rank {rank['rank']} {phase} must contain {measured_steps} samples."
+                )
+    recomputed = summarize_rank_measurements(
+        per_rank=per_rank,
+        local_batch=int(result["task"]["batch_size"]),
+        world_size=world_size,
+        gradient_accumulation=int(result["task"]["gradient_accumulation_steps"]),
+    )
+    for phase in ("forward_seconds", "backward_seconds", "total_step_seconds"):
+        for statistic in ("median", "p95"):
+            _require_close(
+                metrics[phase][statistic],
+                recomputed[phase][statistic],
+                f"metrics.{phase}.{statistic}",
+            )
+    for key in ("microbatch", "optimizer_step"):
+        _require_close(
+            metrics["logical_trajectories_per_second"][key],
+            recomputed["logical_trajectories_per_second"][key],
+            f"metrics.logical_trajectories_per_second.{key}",
+        )
+    for key in ("allocated", "reserved"):
+        _require_close(
+            metrics["peak_memory_bytes"][key],
+            recomputed["peak_memory_bytes"][key],
+            f"metrics.peak_memory_bytes.{key}",
+        )
+
+
+def _require_close(actual: Any, expected: Any, label: str) -> None:
+    if not math.isclose(float(actual), float(expected), rel_tol=1e-6, abs_tol=1e-9):
+        raise ValueError(f"{label} does not match raw per-rank evidence.")
+
+
+def _is_finite_nonnegative(value: Any) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) >= 0.0
 
 
 def _is_finite_positive(value: Any) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0.0
+
+
+def _is_unit_interval(value: Any) -> bool:
+    return _is_finite_nonnegative(value) and float(value) <= 1.0
 
 
 def summarize_rank_measurements(
@@ -421,6 +515,11 @@ def evaluate_pair(
         raise ValueError("Gate evaluation requires sequential then packed_flex results.")
     if sequential["task"]["task_config"] != packed["task"]["task_config"]:
         raise ValueError("Gate candidates must use the same task config.")
+    if _comparison_fingerprint(sequential) != _comparison_fingerprint(packed):
+        raise ValueError(
+            "Gate candidates must share identical source, task, runtime, distributed, and "
+            "protocol fingerprints."
+        )
     if sequential["status"] != "completed" or packed["status"] != "completed":
         return {
             "passed": False,
@@ -462,6 +561,16 @@ def evaluate_pair(
             "p95_step": packed_p95 / sequential_p95,
             "peak_allocated_memory": packed_memory / sequential_memory,
         },
+    }
+
+
+def _comparison_fingerprint(result: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "source": result["source"],
+        "task": result["task"],
+        "runtime": result["runtime"],
+        "distributed": result["distributed"],
+        "protocol": result["protocol"],
     }
 
 

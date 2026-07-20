@@ -24,7 +24,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _completed_result(task_config: str, candidate: str) -> dict:
-    return {
+    chunks = 4
+    measured_steps = 30
+    multiplier = 1 if candidate == "packed_flex" else chunks
+    result = {
         "schema_version": BENCHMARK_SCHEMA_VERSION,
         "benchmark": BENCHMARK_NAME,
         "status": "completed",
@@ -74,16 +77,60 @@ def _completed_result(task_config: str, candidate: str) -> dict:
                 "block_sparsity": 0.75,
             },
             "call_counts": {
-                "outer_model": 30,
-                "mot": 30,
-                "flex_attention": 30,
-                "backward": 30,
+                "outer_model": measured_steps * multiplier,
+                "mot": measured_steps * multiplier,
+                "flex_attention": measured_steps if candidate == "packed_flex" else 0,
+                "backward": measured_steps * multiplier,
             },
-            "per_rank": [{"rank": 0}],
-            "max_rank": {"rank": 0},
+            "per_rank": [],
+            "max_rank": {},
         },
         "output_path": "result.json",
     }
+    _set_gate_metrics(
+        result,
+        total_median=1.0,
+        total_p95=1.2,
+        optimizer_throughput=8.0,
+        peak_memory=1000,
+    )
+    return result
+
+
+def _samples(median: float, p95: float) -> list[float]:
+    return [median] * 27 + [p95] * 3
+
+
+def _set_gate_metrics(
+    result: dict,
+    *,
+    total_median: float,
+    total_p95: float,
+    optimizer_throughput: float,
+    peak_memory: int,
+) -> None:
+    task = result["task"]
+    optimizer_seconds = (
+        task["batch_size"] * task["gradient_accumulation_steps"] / optimizer_throughput
+    )
+    per_rank = [
+        {
+            "rank": 0,
+            "forward_seconds": _samples(0.6, 0.7),
+            "backward_seconds": _samples(0.4, 0.5),
+            "total_step_seconds": _samples(total_median, total_p95),
+            "optimizer_step_seconds": optimizer_seconds,
+            "peak_allocated_bytes": peak_memory,
+            "peak_reserved_bytes": peak_memory + 200,
+        }
+    ]
+    summary = summarize_rank_measurements(
+        per_rank=per_rank,
+        local_batch=task["batch_size"],
+        world_size=1,
+        gradient_accumulation=task["gradient_accumulation_steps"],
+    )
+    result["metrics"].update(summary)
 
 
 class BenchmarkProtocolTests(unittest.TestCase):
@@ -181,25 +228,51 @@ class BenchmarkResultTests(unittest.TestCase):
     def test_gate_accepts_speedup_inside_tail_and_memory_limits(self):
         sequential = _completed_result(CANONICAL_TASKS[0], "sequential")
         packed = _completed_result(CANONICAL_TASKS[0], "packed_flex")
-        packed["metrics"]["total_step_seconds"] = {"median": 0.89, "p95": 1.25}
-        packed["metrics"]["logical_trajectories_per_second"]["optimizer_step"] = 9.0
-        packed["metrics"]["peak_memory_bytes"]["allocated"] = 1090
+        _set_gate_metrics(
+            packed,
+            total_median=0.89,
+            total_p95=1.25,
+            optimizer_throughput=9.0,
+            peak_memory=1090,
+        )
         decision = evaluate_pair(sequential, packed)
         self.assertTrue(decision["passed"])
+
+    def test_gate_rejects_mismatched_fingerprint_and_stale_aggregates(self):
+        sequential = _completed_result(CANONICAL_TASKS[0], "sequential")
+        packed = _completed_result(CANONICAL_TASKS[0], "packed_flex")
+        packed["source"]["commit"] = "different"
+        with self.assertRaisesRegex(ValueError, "identical source"):
+            evaluate_pair(sequential, packed)
+
+        packed = _completed_result(CANONICAL_TASKS[0], "packed_flex")
+        packed["metrics"]["total_step_seconds"]["median"] = 0.01
+        with self.assertRaisesRegex(ValueError, "raw per-rank evidence"):
+            validate_result(packed)
 
     def test_selection_requires_both_4b_and_9b_gates(self):
         results = []
         for task_config in CANONICAL_TASKS:
             sequential = _completed_result(task_config, "sequential")
             packed = _completed_result(task_config, "packed_flex")
-            packed["metrics"]["total_step_seconds"] = {"median": 0.89, "p95": 1.25}
-            packed["metrics"]["logical_trajectories_per_second"]["optimizer_step"] = 9.0
-            packed["metrics"]["peak_memory_bytes"]["allocated"] = 1090
+            _set_gate_metrics(
+                packed,
+                total_median=0.89,
+                total_p95=1.25,
+                optimizer_throughput=9.0,
+                peak_memory=1090,
+            )
             results.extend((sequential, packed))
         self.assertEqual(build_selection(results)["selected_forward_mode"], "packed_flex")
 
         failed_9b = deepcopy(results)
-        failed_9b[-1]["metrics"]["peak_memory_bytes"]["allocated"] = 1200
+        _set_gate_metrics(
+            failed_9b[-1],
+            total_median=0.89,
+            total_p95=1.25,
+            optimizer_throughput=9.0,
+            peak_memory=1200,
+        )
         decision = build_selection(failed_9b)
         self.assertEqual(decision["selected_forward_mode"], "sequential")
         self.assertFalse(decision["packed_default_enabled"])
