@@ -477,6 +477,8 @@ class Wan22Trainer:
         cache_type = getattr(model, "chunkwise_cache_type", None)
         if cache_type is None:
             cache_type = getattr(model, "cache_type", None)
+        torch_version = str(torch.__version__).split("+")[0]
+        torch_major_minor = ".".join(torch_version.split(".")[:2])
         return {
             "resolved_chunk_count": chunk_count,
             "resolved_actions_per_chunk": (
@@ -487,6 +489,14 @@ class Wan22Trainer:
             ),
             "chunkwise_enabled": bool(chunkwise_enabled),
             "cache_type": cache_type,
+            "forward_mode": str(getattr(model, "chunkwise_forward_mode", "sequential")),
+            "sparse_packing": str(getattr(model, "chunkwise_sparse_packing", "interleaved")),
+            "sparse_block_size": int(getattr(model, "chunkwise_sparse_block_size", 128)),
+            "sparse_alignment": str(getattr(model, "chunkwise_sparse_alignment", "none")),
+            "packed_layout_schema_version": int(
+                getattr(model, "chunkwise_packed_layout_schema_version", 1)
+            ),
+            "torch_major_minor": torch_major_minor,
             "supports_chunkwise_training_losses": bool(
                 getattr(model, "supports_chunkwise_training_losses", False)
             ),
@@ -532,6 +542,12 @@ class Wan22Trainer:
             raise RuntimeError(
                 "Chunkwise distributed training requires the prepared per-chunk forward contract."
             )
+        if metadata["forward_mode"] == "packed_flex":
+            capability = getattr(unwrapped_model, "chunkwise_packed_capability", {})
+            if not bool(capability.get("supported", False)):
+                raise RuntimeError(
+                    "Packed FlexAttention chunkwise training requires a validated capability gate."
+                )
         if int(getattr(self.accelerator, "num_processes", 1)) > 1 and self.model is unwrapped_model:
             raise RuntimeError(
                 "Accelerator.prepare did not wrap the chunkwise model for multi-process training."
