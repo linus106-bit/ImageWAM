@@ -636,6 +636,11 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         packed.chunkwise_forward_mode = "packed_flex"
         with self.assertRaisesRegex(ValueError, "invalid with packed"):
             packed(prepared_chunkwise_inputs=prepared, chunk_index=0)
+        malformed = {**prepared, "target_valid": torch.ones(1, 1, dtype=torch.bool)}
+        with self.assertRaisesRegex(ValueError, "target_valid"):
+            sequential(prepared_chunkwise_inputs=malformed, chunk_index=0)
+        with self.assertRaisesRegex(ValueError, "target_valid"):
+            packed(prepared_chunkwise_inputs=malformed)
 
     def test_packed_forward_matches_sequential_outputs_gradients_and_batch_padded_ownership(self):
         def run_model(forward_mode):
@@ -646,6 +651,11 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
             model.train_action_scheduler = _RecordingScheduler("action", calls)
             prepared = model.prepare_chunkwise_training_inputs({})
             captured = {}
+            noise_calls = []
+
+            def fake_randn_like(tensor):
+                noise_calls.append(tuple(tensor.shape))
+                return torch.full_like(tensor, float(len(noise_calls)))
 
             def fake_sparse_mask(*, layout, query_valid, key_valid, state_positions, device, num_heads):
                 del device, num_heads
@@ -664,32 +674,59 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
                 )
 
             if forward_mode == "packed_flex":
-                with mock.patch(
-                    "imagewam.models.backbones.imagewam.build_packed_block_sparse_mask",
-                    side_effect=fake_sparse_mask,
+                with mock.patch("imagewam.models.backbones.imagewam.torch.randn_like", side_effect=fake_randn_like), mock.patch(
+                    "imagewam.models.backbones.imagewam.build_packed_block_sparse_mask", side_effect=fake_sparse_mask
                 ) as sparse_builder:
-                    loss, metrics = model(prepared_chunkwise_inputs=prepared)
+                    with mock.patch.object(model.mot, "forward", wraps=model.mot.forward) as mot_forward:
+                        loss, metrics = model(prepared_chunkwise_inputs=prepared)
                 self.assertEqual(sparse_builder.call_count, 1)
+                self.assertEqual(mot_forward.call_count, 1)
             else:
                 loss = None
                 metrics = {}
-                for chunk_index in range(model.resolved_chunk_count):
-                    chunk_loss, chunk_metrics = model(
-                        prepared_chunkwise_inputs=prepared,
-                        chunk_index=chunk_index,
-                    )
-                    loss = chunk_loss if loss is None else loss + chunk_loss
-                    for key, value in chunk_metrics.items():
-                        metrics[key] = metrics.get(key, 0.0) + value
+                with mock.patch("imagewam.models.backbones.imagewam.torch.randn_like", side_effect=fake_randn_like):
+                    for chunk_index in range(model.resolved_chunk_count):
+                        chunk_loss, chunk_metrics = model(
+                            prepared_chunkwise_inputs=prepared,
+                            chunk_index=chunk_index,
+                        )
+                        loss = chunk_loss if loss is None else loss + chunk_loss
+                        for key, value in chunk_metrics.items():
+                            metrics[key] = metrics.get(key, 0.0) + value
                 captured = None
 
             loss.backward()
-            return loss.detach(), metrics, model.mot.scale.grad.detach().clone(), calls, captured
+            return (
+                loss.detach(),
+                metrics,
+                model.mot.scale.grad.detach().clone(),
+                calls,
+                noise_calls,
+                list(model.video_expert.prefix_lengths),
+                list(model.video_expert.prefix_ordinals),
+                captured,
+            )
 
-        torch.manual_seed(1234)
-        sequential_loss, sequential_metrics, sequential_grad, sequential_calls, _ = run_model("sequential")
-        torch.manual_seed(1234)
-        packed_loss, packed_metrics, packed_grad, packed_calls, captured = run_model("packed_flex")
+        (
+            sequential_loss,
+            sequential_metrics,
+            sequential_grad,
+            sequential_calls,
+            sequential_noise_calls,
+            sequential_prefix_lengths,
+            sequential_prefix_ordinals,
+            _,
+        ) = run_model("sequential")
+        (
+            packed_loss,
+            packed_metrics,
+            packed_grad,
+            packed_calls,
+            packed_noise_calls,
+            packed_prefix_lengths,
+            packed_prefix_ordinals,
+            captured,
+        ) = run_model("packed_flex")
 
         expected_calls = [
             "video:sample:1",
@@ -707,13 +744,38 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         ]
         self.assertEqual(sequential_calls, expected_calls)
         self.assertEqual(packed_calls, expected_calls)
+        expected_noise_calls = [(1, 1, 2), (1, 1, 2), (1, 1, 2), (1, 1, 2)]
+        self.assertEqual(sequential_noise_calls, expected_noise_calls)
+        self.assertEqual(packed_noise_calls, expected_noise_calls)
+        self.assertEqual(sequential_prefix_lengths, [1, 2])
+        self.assertEqual(packed_prefix_lengths, [1, 2])
+        self.assertEqual(sequential_prefix_ordinals, [[10.0], [10.0, 11.0]])
+        self.assertEqual(packed_prefix_ordinals, [[10.0], [10.0, 11.0]])
         self.assertTrue(torch.allclose(packed_loss, sequential_loss, atol=1e-6))
         self.assertTrue(torch.allclose(packed_grad, sequential_grad, atol=1e-6))
         self.assertAlmostEqual(float(packed_metrics["loss_video"]), float(sequential_metrics["loss_video"]), places=6)
         self.assertAlmostEqual(float(packed_metrics["loss_action"]), float(sequential_metrics["loss_action"]), places=6)
         self.assertEqual(packed_metrics["chunk_count"], 2.0)
-        self.assertIn("chunk/0/loss_video", packed_metrics)
-        self.assertIn("chunk/1/loss_video", packed_metrics)
+        for key in (
+            "loss_video",
+            "loss_action",
+            "chunk_count",
+            "packed/attention_sequence_length",
+            "chunk/0/loss_video",
+            "chunk/0/loss_action",
+            "chunk/0/observation_prefix_tokens",
+            "chunk/1/loss_video",
+            "chunk/1/loss_action",
+            "chunk/1/observation_prefix_tokens",
+        ):
+            self.assertIn(key, packed_metrics)
+        per_chunk_total = (
+            packed_metrics["chunk/0/loss_video"]
+            + packed_metrics["chunk/0/loss_action"]
+            + packed_metrics["chunk/1/loss_video"]
+            + packed_metrics["chunk/1/loss_action"]
+        )
+        self.assertTrue(torch.allclose(packed_loss, per_chunk_total))
         self.assertTrue(packed_metrics["chunk/1/loss_video"].requires_grad)
         self.assertEqual(float(packed_metrics["chunk/1/loss_video"]), 0.0)
 

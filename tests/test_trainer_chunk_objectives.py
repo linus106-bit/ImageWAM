@@ -240,6 +240,26 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["chunk_count"], 4.0)
         self.assertAlmostEqual(parameter.grad.item(), 10.0)
 
+    def test_packed_chunk_objective_uses_outer_prepared_wrapper_once(self):
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        module = _chunk_model(chunkwise_forward_mode="packed_flex")
+
+        def packed_loss_fn():
+            return parameter * 10.0, {"loss_video": parameter * 10.0, "chunk_count": 4.0}
+
+        module.packed_loss_fn = packed_loss_fn
+        wrapped = _PreparedWrapper(module)
+        trainer = _trainer(wrapped)
+
+        loss, metrics, _, _ = trainer._backward_training_objectives(wrapped, {"batch": 1})
+
+        self.assertEqual(module.prepared_samples, [{"batch": 1}])
+        self.assertEqual(wrapped.forward_chunks, [None])
+        self.assertEqual(trainer.accelerator.backward_losses, [10.0])
+        self.assertAlmostEqual(loss.item(), 10.0)
+        self.assertAlmostEqual(metrics["chunk_count"], 4.0)
+        self.assertAlmostEqual(parameter.grad.item(), 10.0)
+
     def test_packed_validation_uses_one_prepared_forward(self):
         model = _chunk_model(chunkwise_forward_mode="packed_flex")
         calls = []
