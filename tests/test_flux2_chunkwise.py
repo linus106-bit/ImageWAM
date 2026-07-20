@@ -289,6 +289,49 @@ class Flux2ChunkwiseTest(unittest.TestCase):
         self.assertEqual(second.state_positions.tolist(), [1])
         clear_packed_topology_cache()
 
+    def test_packed_topology_cache_separates_head_count(self):
+        clear_packed_topology_cache()
+        layout = build_packed_chunk_layout(
+            chunks=(
+                {
+                    "text_length": 2,
+                    "observation_token_lengths": (1,),
+                    "target_length": 1,
+                    "action_length": 1,
+                },
+            ),
+            sparse_block_size=4,
+        )
+        create_calls = []
+
+        def fake_create(*_args, **kwargs):
+            create_calls.append(kwargs["H"])
+            return {"heads": kwargs["H"]}
+
+        query_valid = torch.ones(1, layout.total_token_count, dtype=torch.bool)
+        key_valid = torch.ones(1, layout.total_token_count, dtype=torch.bool)
+        one_head = build_packed_block_sparse_mask(
+            layout=layout,
+            query_valid=query_valid,
+            key_valid=key_valid,
+            device="cpu",
+            num_heads=1,
+            create_block_mask_fn=fake_create,
+        )
+        two_heads = build_packed_block_sparse_mask(
+            layout=layout,
+            query_valid=query_valid,
+            key_valid=key_valid,
+            device="cpu",
+            num_heads=2,
+            create_block_mask_fn=fake_create,
+        )
+
+        self.assertEqual(create_calls, [1, 2])
+        self.assertEqual(one_head.block_mask, {"heads": 1})
+        self.assertEqual(two_heads.block_mask, {"heads": 2})
+        clear_packed_topology_cache()
+
     def test_packed_topology_cache_moves_touched_entries_before_eviction(self):
         clear_packed_topology_cache()
         retained = object()
