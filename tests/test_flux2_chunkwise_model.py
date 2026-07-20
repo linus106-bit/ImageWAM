@@ -721,7 +721,13 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         layout = captured["layout"]
         self.assertEqual(layout.sparse_packing, "batch_padded")
         self.assertEqual(layout.total_token_count, 6)
-        self.assertEqual(captured["query_valid"].tolist(), [[True] * 6, [True] * 6])
+        self.assertEqual(
+            captured["query_valid"].tolist(),
+            [
+                [True, True, True, False, True, True],
+                [True, True, True, True, True, True],
+            ],
+        )
         self.assertEqual(
             captured["key_valid"].tolist(),
             [
