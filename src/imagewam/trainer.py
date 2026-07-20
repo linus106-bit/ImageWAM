@@ -25,6 +25,13 @@ logger = get_logger(__name__)
 
 
 class Wan22Trainer:
+    @staticmethod
+    def _deepspeed_zero_stage(accelerator):
+        state = getattr(accelerator, "state", None)
+        plugin = getattr(state, "deepspeed_plugin", None)
+        config = getattr(plugin, "deepspeed_config", {}) if plugin is not None else {}
+        return int(config.get("zero_optimization", {}).get("stage", 0))
+
     def __init__(self, model, train_dataset, val_dataset=None, *, cfg: DictConfig):
         self.model = model
         self.train_dataset = train_dataset
@@ -74,7 +81,7 @@ class Wan22Trainer:
         logger.info(
             "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
             self.accelerator.distributed_type,
-            self.accelerator.state.deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown"),
+            self._deepspeed_zero_stage(self.accelerator),
             self.accelerator.num_processes,
             self.accelerator.process_index,
             self.mixed_precision,
@@ -508,6 +515,17 @@ class Wan22Trainer:
         if chunk_count <= 1:
             return None, 1
 
+        forward_mode = metadata["forward_mode"]
+        if forward_mode not in {"sequential", "packed_flex"}:
+            raise ValueError(
+                "Chunkwise training requires `forward_mode` to be 'sequential' or "
+                f"'packed_flex', got {forward_mode!r}."
+            )
+        if not isinstance(sample, dict):
+            raise ValueError(
+                f"Chunkwise training requires a dict sample, got {type(sample)}."
+            )
+
         unwrapped_model = self.accelerator.unwrap_model(model)
         if str(getattr(unwrapped_model, "stack", "")) != "flux2":
             raise ValueError("Chunkwise training with K>1 is supported only for the FLUX.2 stack.")
@@ -530,12 +548,22 @@ class Wan22Trainer:
                 "FLUX.2 chunkwise training requires callable "
                 "`prepare_chunkwise_training_inputs(sample)`."
             )
-        return prepare_inputs(sample), chunk_count
+        prepared_inputs = prepare_inputs(sample)
+        if not isinstance(prepared_inputs, dict):
+            raise ValueError(
+                "`prepare_chunkwise_training_inputs(sample)` must return a dict, "
+                f"got {type(prepared_inputs)}."
+            )
+        return prepared_inputs, chunk_count
 
     def _validate_chunkwise_distributed_contract(self):
         metadata = self._chunkwise_training_metadata(self.model)
         if metadata["resolved_chunk_count"] <= 1:
             return
+
+        forward_mode = metadata["forward_mode"]
+        if forward_mode not in {"sequential", "packed_flex"}:
+            raise ValueError(f"Unsupported chunkwise forward mode: {forward_mode!r}.")
 
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         if not bool(getattr(unwrapped_model, "supports_chunkwise_prepared_forward", False)):
@@ -553,23 +581,34 @@ class Wan22Trainer:
                 "Accelerator.prepare did not wrap the chunkwise model for multi-process training."
             )
 
-        distributed_type = str(getattr(self.accelerator, "distributed_type", "")).upper()
-        if "FSDP" in distributed_type or "MEGATRON" in distributed_type:
+        distributed_type = getattr(self.accelerator, "distributed_type", "")
+        distributed_name = str(getattr(distributed_type, "name", distributed_type)).split(".")[-1].upper()
+        supported_distributed_types = {"NO", "MULTI_CPU", "MULTI_GPU", "DEEPSPEED"}
+        if distributed_name not in supported_distributed_types:
             raise RuntimeError(
                 "Chunkwise prepared-input training is verified for DDP and DeepSpeed ZeRO stages 0-2; "
-                f"distributed type {distributed_type!r} is not supported."
+                f"distributed type {distributed_name!r} is not supported."
             )
 
-        state = getattr(self.accelerator, "state", None)
-        plugin = getattr(state, "deepspeed_plugin", None)
-        deepspeed_config = getattr(plugin, "deepspeed_config", {}) if plugin is not None else {}
-        zero_stage = int(deepspeed_config.get("zero_optimization", {}).get("stage", 0))
+        zero_stage = self._deepspeed_zero_stage(self.accelerator)
         if zero_stage >= 3:
             raise RuntimeError(
                 "Chunkwise prepared-input training currently supports DDP and DeepSpeed ZeRO stages 0-2; "
                 f"ZeRO stage {zero_stage} is rejected because frozen preparation outside the engine "
                 "has not been proven safe with partitioned parameters."
             )
+        logger.info(
+            "Chunkwise training contract: mode=%s K=%d distributed_type=%s zero_stage=%d "
+            "sparse_packing=%s block_size=%d alignment=%s layout_schema=%d",
+            forward_mode,
+            metadata["resolved_chunk_count"],
+            distributed_name,
+            zero_stage,
+            metadata["sparse_packing"],
+            metadata["sparse_block_size"],
+            metadata["sparse_alignment"],
+            metadata["packed_layout_schema_version"],
+        )
 
     @staticmethod
     def _accumulate_loss_metrics(accumulated: dict, contribution: dict):
@@ -652,6 +691,10 @@ class Wan22Trainer:
         return total_loss, loss_metrics, forward_elapsed, backward_elapsed
 
     def _validate_resume_chunkwise_metadata(self, payload: dict, state_dir: str):
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"Trainer-state metadata in {state_dir} must be a JSON object, got {type(payload)}."
+            )
         expected = self._chunkwise_training_metadata()
         metadata_keys = tuple(expected)
         present_keys = [key for key in metadata_keys if key in payload]
@@ -679,6 +722,27 @@ class Wan22Trainer:
                 for key, (old, new) in mismatches.items()
             )
             raise ValueError(f"Chunkwise trainer-state metadata mismatch for {state_dir}: {detail}")
+
+    @staticmethod
+    def _validate_trainer_state_progress(payload: dict, state_dir: str):
+        def require_nonnegative_int(key: str):
+            value = payload.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"Trainer-state `{key}` in {state_dir} must be a non-negative integer, "
+                    f"got {value!r}."
+                )
+
+        require_nonnegative_int("global_step")
+        has_epoch = "epoch" in payload
+        has_batch = "batch_in_epoch" in payload
+        if has_epoch != has_batch:
+            raise ValueError(
+                f"Trainer state in {state_dir} must contain both `epoch` and `batch_in_epoch`, or neither."
+            )
+        if has_epoch:
+            require_nonnegative_int("epoch")
+            require_nonnegative_int("batch_in_epoch")
 
     def _set_dit_only_train_mode(self):
         # Match DiffSynth's freeze_except("dit"): only DiT stays trainable/in-train-mode.
@@ -1148,15 +1212,22 @@ class Wan22Trainer:
         return ckpt_path
 
     def _save_trainer_state(self, state_path: str):
-        state_file = os.path.join(state_path, "trainer_state.json")
+        state_file = Path(state_path) / "trainer_state.json"
+        temp_file = state_file.with_name(f".{state_file.name}.{os.getpid()}.tmp")
         payload = {
             "global_step": int(self.global_step),
             "epoch": int(self.epoch),
             "batch_in_epoch": int(self.batch_in_epoch),
             **self._chunkwise_training_metadata(),
         }
-        with open(state_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=True, indent=2)
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=True, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_file, state_file)
+        finally:
+            temp_file.unlink(missing_ok=True)
 
     def _prune_old_state_checkpoints(self, keep_step_tag: str):
         if not self.keep_latest_state_only:
@@ -1197,6 +1268,7 @@ class Wan22Trainer:
             with open(state_file, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             self._validate_resume_chunkwise_metadata(payload, state_dir)
+            self._validate_trainer_state_progress(payload, state_dir)
             self.accelerator.load_state(input_dir=state_dir)
             self.global_step = int(payload["global_step"])
 
