@@ -348,19 +348,40 @@ def _build_structural_mask_mod(
     role = _layout_role_tensor(layout, device=device)
     local_index = _layout_local_index_tensor(layout, device=device)
     padding_id = _ROLE_ID["padding"]
+    text_id = _ROLE_ID["text"]
+    observation_id = _ROLE_ID["observation"]
+    target_id = _ROLE_ID["target"]
+    action_id = _ROLE_ID["action"]
+    observation_ordinal = torch.full(
+        (layout.total_token_count,), -1, device=device, dtype=torch.long
+    )
+    for segment in layout.segments:
+        for ordinal, (start, end) in enumerate(segment.clean_observation_ranges):
+            observation_ordinal[start:end] = ordinal
 
     def mask_mod(_batch: torch.Tensor, _head: torch.Tensor, query_index: torch.Tensor, key_index: torch.Tensor) -> torch.Tensor:
         same_pattern = owner[query_index] == owner[key_index]
-        query_not_padding = role[query_index] != padding_id
-        key_not_padding = role[key_index] != padding_id
-        # Local packed order is already text, observations, target, action.  The
-        # structural predicate over-approximates dynamic validity but preserves
-        # causal local ordering and the current target/action joint group.
-        local_causal = local_index[key_index] <= local_index[query_index]
-        query_current = (role[query_index] == _ROLE_ID["target"]) | (role[query_index] == _ROLE_ID["action"])
-        key_current = (role[key_index] == _ROLE_ID["target"]) | (role[key_index] == _ROLE_ID["action"])
+        query_role = role[query_index]
+        key_role = role[key_index]
+        query_not_padding = query_role != padding_id
+        key_not_padding = key_role != padding_id
+        text_pair = (query_role == text_id) & (key_role == text_id)
+        observation_query = query_role == observation_id
+        observation_key = key_role == observation_id
+        observation_causal = (
+            observation_query
+            & observation_key
+            & (observation_ordinal[key_index] <= observation_ordinal[query_index])
+        )
+        observation_to_text = observation_query & (key_role == text_id)
+        query_current = (query_role == target_id) | (query_role == action_id)
+        key_current = (key_role == target_id) | (key_role == action_id)
         current_joint = query_current & key_current
-        return same_pattern & query_not_padding & key_not_padding & (local_causal | current_joint)
+        current_to_prefix = query_current & ((key_role == text_id) | observation_key)
+        # Conservative fallback for unknown future roles while preserving current local order.
+        local_causal = local_index[key_index] <= local_index[query_index]
+        allowed_local = text_pair | observation_to_text | observation_causal | current_to_prefix | current_joint | local_causal
+        return same_pattern & query_not_padding & key_not_padding & allowed_local
 
     return mask_mod
 

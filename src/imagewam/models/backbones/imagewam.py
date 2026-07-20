@@ -11,6 +11,8 @@ from PIL import Image
 from imagewam.chunkwise import (
     PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
     build_chunkwise_causal_mask,
+    build_packed_block_sparse_mask,
+    build_packed_chunk_layout,
     chunkwise_loss_contribution,
 )
 from imagewam.utils.logging_config import get_logger
@@ -140,7 +142,7 @@ class ImageWAM(torch.nn.Module):
             "loss_reduction": "mean",
             "cache_type": "observation_prefix",
             "forward_mode": "sequential",
-            "sparse_packing": "interleaved",
+            "sparse_packing": "batch_padded",
             "sparse_block_size": 128,
             "sparse_alignment": "none",
             "packed_layout_schema_version": PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
