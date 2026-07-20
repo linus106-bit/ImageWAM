@@ -497,7 +497,7 @@ class Wan22Trainer:
             "chunkwise_enabled": bool(chunkwise_enabled),
             "cache_type": cache_type,
             "forward_mode": str(getattr(model, "chunkwise_forward_mode", "sequential")),
-            "sparse_packing": str(getattr(model, "chunkwise_sparse_packing", "interleaved")),
+            "sparse_packing": str(getattr(model, "chunkwise_sparse_packing", "batch_padded")),
             "sparse_block_size": int(getattr(model, "chunkwise_sparse_block_size", 128)),
             "sparse_alignment": str(getattr(model, "chunkwise_sparse_alignment", "none")),
             "packed_layout_schema_version": int(

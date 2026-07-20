@@ -185,7 +185,7 @@ Mask 생성 전 다음을 검증한다.
 - frozen shared preparation: `prepare_chunkwise_training_inputs(sample)`
 - canonical trainable forward: `model(prepared_chunkwise_inputs=prepared, chunk_index=i)`
 
-전체 동작:
+`sequential` reference 동작:
 
 ```python
 prepared = unwrapped_model.prepare_chunkwise_training_inputs(sample)
@@ -199,6 +199,23 @@ for i in range(K):
 ```
 
 `unwrapped_model`에서 실행해도 되는 것은 `torch.no_grad()` frozen VAE/text preparation뿐이다. Trainable FLUX projection, proprio encoder, MoT, loss는 반드시 `Accelerator.prepare`가 반환한 바깥 `prepared_model(...)` 호출 안에서 실행한다. 따라서 DDP/DeepSpeed의 forward lifecycle과 gradient reducer를 우회하지 않는다. `training_loss(sample)`은 K>1에서 legacy endpoint objective로 조용히 fallback하지 않고 실패해야 한다.
+
+`packed_flex`는 동일한 `prepared` payload와 diffusion draw 순서를 사용하지만 wrapper 호출을 하나로 합친다.
+
+```python
+prepared = unwrapped_model.prepare_chunkwise_training_inputs(sample)
+loss, metrics = prepared_model(prepared_chunkwise_inputs=prepared)
+accelerator.backward(loss)
+```
+
+현재 선택된 packing은 `batch_padded`다. 각 `(batch, chunk-pattern)` row는 독립된 token sequence를 가지며, 모든 MoT layer는 ImageWAM 소유 `PackedBlockSparseMask`를 통해 한 번 호출된다. cached topology는 structural layout만 보유하고, 현재 batch의 query/key validity와 state position은 매 forward immutable snapshot으로 전달한다. Production packed path는 dense `[B,L,L]` mask를 만들지 않는다.
+
+| Mode | Outer forward / logical microbatch | Backward | 용도 |
+|---|---:|---:|---|
+| `sequential` | `K` | `K` | 기본값, parity oracle, rollback |
+| `packed_flex` | `1` | `1` | CUDA + FlexAttention opt-in |
+
+명시적으로 `packed_flex`를 요청했는데 CUDA, PyTorch FlexAttention, FLUX.2, K>1, 지원 distributed backend 조건이 충족되지 않으면 자동 fallback하지 않고 시작 시 실패한다.
 
 ### Exact objective
 
@@ -236,7 +253,7 @@ L = sum_i L_i
 - `src/imagewam/trainer.py`의 training step
 - `src/imagewam/trainer.py`의 validation loss aggregation
 
-한 logical batch의 순서:
+`sequential` logical batch의 순서:
 
 ```text
 zero_grad / accumulation context 시작
@@ -248,13 +265,24 @@ zero_grad / accumulation context 시작
 optimizer.step 한 번
 ```
 
+`packed_flex` logical batch의 순서:
+
+```text
+zero_grad / accumulation context 시작
+  frozen shared input preparation 한 번
+  prepared_model packed forward 한 번 -> aggregate L = sum_i L_i
+  backward(L) 한 번
+optimizer.step 한 번
+```
+
 - `retain_graph=True`를 사용하지 않는다.
 - Outer gradient accumulation 정책은 기존 trainer가 관리한다.
-- 모든 rank가 정확히 `K`번 backward 해야 한다.
+- 모든 rank는 동일한 mode를 사용하고 `sequential`이면 정확히 `K`번, `packed_flex`이면 정확히 한 번 backward 해야 한다.
 - 모든 trainable chunk forward는 unwrapped module이 아니라 동일한 prepared wrapper를 통과해야 한다.
 - Multi-process인데 `Accelerator.prepare` 결과가 실제 wrapper가 아니면 시작 시 실패한다.
 - Frozen preparation을 engine 밖에서 실행하는 안전성이 검증되지 않은 ZeRO-3는 시작 시 거부한다. 현재 지원 범위는 DDP와 ZeRO 0-2다.
-- 한 chunk가 완전히 padded여도 생략하지 말고 differentiable zero anchor를 yield한다.
+- Sequential에서 한 chunk가 완전히 padded여도 생략하지 말고 differentiable zero anchor를 yield한다.
+- Packed에서 fully padded contribution도 aggregate graph 안에 differentiable zero로 남긴다.
 - Metric은 마지막 chunk 값으로 덮어쓰지 않고 모든 chunk를 합산한다.
 - Validation도 persistent cache 없이 모든 `K` contribution을 합산한다.
 
@@ -277,6 +305,12 @@ optimizer.step 한 번
 - `resolved_total_action_horizon`
 - `chunkwise_enabled`
 - `cache_type`
+- `forward_mode`
+- `sparse_packing`
+- `sparse_block_size`
+- `sparse_alignment`
+- `packed_layout_schema_version`
+- PyTorch major/minor
 
 Resume 정책:
 
@@ -292,16 +326,15 @@ Observation-prefix cache tensor는 checkpoint에 저장하지 않는다.
 
 ## 7. 테스트 구현 지점
 
-신규 first-party test 디렉터리:
+관련 first-party tests:
 
 ```text
-tests/
-  test_chunkwise_dataset.py
-  test_flux2_chunk_inputs.py
-  test_flux2_chunk_ids.py
-  test_flux2_chunk_mask.py
-  test_flux2_chunk_training.py
-  test_trainer_chunk_objectives.py
+tests/test_chunkwise_dataset_config.py
+tests/test_flux2_chunkwise.py
+tests/test_flux2_chunkwise_model.py
+tests/test_mot_packed_attention.py
+tests/test_trainer_chunk_objectives.py
+tests/test_flux2_chunkwise_benchmark.py
 ```
 
 필수 검증:
@@ -320,6 +353,9 @@ tests/
 10. `K=1` inputs, masks, predictions, loss, gradient, optimizer state, resume가 기존 경로와 일치한다.
 11. Non-FLUX task/config behavior가 변하지 않는다.
 12. Cache가 generator 호출마다 초기화되고 `state_dict`에 없다.
+13. Packed outer/MoT forward와 backward가 logical microbatch당 각각 한 번이다.
+14. Sequential/packed output, additive loss, metric, gradient가 동일하다.
+15. Benchmark schema, 10/30 protocol, max-rank aggregation, 4B/9B gate, no-CUDA 결정이 고정된다.
 
 실제 모듈 검증 순서:
 
@@ -332,15 +368,17 @@ tests/
 
 ## 8. 구현 순서 체크리스트
 
-- [ ] 기존 `K=1` behavior를 regression test로 고정한다.
-- [ ] Dataset에 `K × 16` action horizon과 boundary sampling을 추가하고 FLUX-only data overlay를 만든다.
-- [ ] Model config/runtime에 immutable chunkwise config를 연결한다.
-- [ ] Multi-observation input/ID/action/state helper를 구현한다.
-- [ ] Per-example offset 기반 chunk causal mask를 구현한다.
-- [ ] Exact denominator 기반 sequential loss iterator를 구현한다.
-- [ ] Trainer의 multi-backward/one-step 및 metric aggregation을 연결한다.
-- [ ] Checkpoint metadata와 resume validation을 추가한다.
-- [ ] CPU, single-GPU, ZeRO, resume 검증을 순서대로 실행한다.
+- [x] 기존 `K=1` behavior를 regression test로 고정한다.
+- [x] Dataset에 `K × 16` action horizon과 boundary sampling을 추가하고 FLUX-only data overlay를 만든다.
+- [x] Model config/runtime에 immutable chunkwise config를 연결한다.
+- [x] Multi-observation input/ID/action/state helper를 구현한다.
+- [x] Per-example offset 기반 chunk causal mask를 구현한다.
+- [x] Exact denominator 기반 sequential loss iterator를 구현한다.
+- [x] Packed `batch_padded` sparse mask/MoT/objective 경로를 구현한다.
+- [x] Trainer의 sequential multi-backward와 packed one-backward 경로를 연결한다.
+- [x] Checkpoint metadata와 resume validation을 추가한다.
+- [x] CPU unit/model/trainer/DDP/Accelerate 검증을 추가한다.
+- [ ] Target CUDA single-GPU, ZeRO-1/2, 4B/9B 성능 gate를 실행한다.
 
 ## 9. 이번 구현에서 하지 않는 것
 
@@ -352,3 +390,60 @@ tests/
 - 새 dependency 추가
 
 Persistent layer K/V cache는 causal correctness, `K=1` parity, gradient equivalence, GPU memory/throughput baseline을 확보한 뒤 별도의 실험 기능으로 검토한다.
+
+## 10. Packed mode 운영과 benchmark
+
+Base config는 성능 gate가 증명되기 전까지 다음을 유지한다.
+
+```yaml
+chunkwise_causal:
+  forward_mode: sequential
+  sparse_packing: batch_padded
+```
+
+CUDA 없이 환경·task geometry·스키마와 default 결정을 기록한다.
+
+```bash
+PYTHONPATH=src python scripts/benchmark_flux2_packed_chunk_forward.py probe
+```
+
+이 명령은 `.omx/benchmarks/block-sparse-packed-chunk-forward/<UTC>/` 아래에 4B/9B × sequential/packed candidate JSON과 `selection.json`을 immutable하게 기록한다. CUDA가 없으면 두 gate를 `unavailable`로 기록하고 `selected_forward_mode=sequential`을 선택한다. 성능 수치를 추정하거나 성공으로 간주하지 않는다.
+
+Target CUDA에서 official run은 후보마다 새 subprocess를 사용한다. Runner는 전달받은 환경 변수에 따라 실제 task를 실행하고 `IMAGEWAM_BENCHMARK_RESULT_PATH`에 schema v1 JSON을 기록해야 한다.
+
+```bash
+PYTHONPATH=src python scripts/benchmark_flux2_packed_chunk_forward.py \
+  --warmup-steps 10 \
+  --measured-steps 30 \
+  --seed 0 \
+  run -- python /path/to/flux2_candidate_runner.py
+```
+
+Runner environment contract:
+
+- `IMAGEWAM_BENCHMARK_TASK_CONFIG`
+- `IMAGEWAM_BENCHMARK_FORWARD_MODE`
+- `IMAGEWAM_BENCHMARK_WARMUP_STEPS=10`
+- `IMAGEWAM_BENCHMARK_MEASURED_STEPS>=30`
+- `IMAGEWAM_BENCHMARK_SEED`
+- `IMAGEWAM_BENCHMARK_RESULT_PATH`
+- candidate별 격리된 `TORCHINDUCTOR_CACHE_DIR`
+
+4B와 9B 모두 correctness/no-OOM을 통과하고 median step 10% 감소 또는 optimizer throughput 1.10x, p95 regression 5% 이하, peak allocated memory regression 10% 이하를 만족해야만 packed default를 허용한다. 하나라도 미측정/실패이면 packed는 명시적 override로만 사용한다.
+
+```bash
+# opt-in
+... model.chunkwise_causal.forward_mode=packed_flex
+
+# rollback
+... model.chunkwise_causal.forward_mode=sequential
+```
+
+지원 matrix:
+
+| 환경 | `sequential` | `packed_flex` |
+|---|---|---|
+| CPU | 지원 | 시작 시 거부 |
+| CUDA + PyTorch FlexAttention | 지원 | opt-in |
+| raw DDP / Accelerate / DeepSpeed ZeRO 0-2 | 지원 | capability 검증 후 지원 |
+| FSDP / Megatron / ZeRO-3 | 거부 | 거부 |

@@ -21,7 +21,7 @@ chunkwise_causal:
   loss_reduction: mean
   cache_type: observation_prefix
   forward_mode: sequential
-  sparse_packing: interleaved
+  sparse_packing: batch_padded
   sparse_block_size: 128
   sparse_alignment: none
 
