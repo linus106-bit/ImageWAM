@@ -2,6 +2,7 @@ import os
 import socket
 import types
 import unittest
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -9,6 +10,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel
 
+from imagewam.chunkwise import PackedBlockSparseMask
 from imagewam.models.backbones.imagewam import ImageWAM
 
 
@@ -43,6 +45,41 @@ class _Scheduler:
         return torch.ones_like(timestep)
 
 
+class _RecordingScheduler:
+    num_train_timesteps = 8
+
+    def __init__(self, name, calls):
+        self.name = name
+        self.calls = calls
+        self.sample_count = 0
+
+    def sample_training_t(self, batch_size, device, dtype):
+        self.sample_count += 1
+        self.calls.append(f"{self.name}:sample:{self.sample_count}")
+        return torch.full(
+            (batch_size,),
+            float(self.sample_count),
+            device=device,
+            dtype=dtype,
+        )
+
+    def add_noise(self, clean, noise, timestep):
+        self.calls.append(f"{self.name}:add:{int(timestep[0].item())}")
+        while timestep.ndim < clean.ndim:
+            timestep = timestep.unsqueeze(-1)
+        return clean + (0.125 * noise.to(dtype=clean.dtype)) + timestep.to(dtype=clean.dtype)
+
+    def training_target(self, clean, noise, timestep):
+        del clean
+        self.calls.append(f"{self.name}:target:{int(timestep[0].item())}")
+        while timestep.ndim < noise.ndim:
+            timestep = timestep.unsqueeze(-1)
+        return noise.to(dtype=torch.float32) + timestep.to(dtype=torch.float32)
+
+    def training_weight(self, timestep):
+        return torch.ones_like(timestep)
+
+
 class _VideoExpert(nn.Module):
     def __init__(self):
         super().__init__()
@@ -62,9 +99,10 @@ class _VideoExpert(nn.Module):
     ):
         self.prefix_lengths.append(int(ref_image_hidden_states.shape[1]))
         self.prefix_ordinals.append(ref_img_ids[0, :, 0].tolist())
+        img_tokens = torch.cat([ref_image_hidden_states, x], dim=1)
         return {
-            "tokens": {"txt": context, "img": torch.cat([ref_image_hidden_states, x], dim=1)},
-            "freqs": {},
+            "tokens": {"txt": context, "img": img_tokens},
+            "freqs": {"txt": torch.zeros_like(context), "img": torch.zeros_like(img_tokens)},
             "t_mod": {},
             "text_mask": context_mask,
             "target_len": int(x.shape[1]),
@@ -100,7 +138,10 @@ class _Mot(nn.Module):
         self.masks = []
 
     def forward(self, embeds_all, attention_mask, **_kwargs):
-        self.masks.append(attention_mask["double_joint"].detach().clone())
+        mask = attention_mask["double_joint"]
+        if isinstance(mask, torch.Tensor):
+            mask = mask.detach().clone()
+        self.masks.append(mask)
         return {
             "video": {
                 "txt": embeds_all["video"]["txt"] * self.scale,
@@ -121,6 +162,10 @@ def _chunkwise_forward_contract_model(input_scale=1.0):
     model.resolved_chunk_count = 2
     model.resolved_actions_per_chunk = 1
     model.resolved_total_action_horizon = 2
+    model.chunkwise_forward_mode = "sequential"
+    model.chunkwise_sparse_packing = "batch_padded"
+    model.chunkwise_sparse_alignment = "none"
+    model.chunkwise_sparse_block_size = 128
     model.proprio_encoder = None
     model.supports_chunkwise_prepared_forward = True
     model.loss_lambda_video = 1.0
@@ -575,6 +620,115 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         self.assertEqual(len(model.mot.masks), 1)
         loss.backward()
         self.assertIsNotNone(model.mot.scale.grad)
+
+    def test_prepared_forward_api_validates_sequential_and_packed_modes(self):
+        sequential = _chunkwise_forward_contract_model()
+        prepared = sequential.prepare_chunkwise_training_inputs({})
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            sequential(sample={}, prepared_chunkwise_inputs=prepared, chunk_index=0)
+        with self.assertRaisesRegex(ValueError, "required"):
+            sequential(prepared_chunkwise_inputs=prepared)
+        with self.assertRaisesRegex(ValueError, "requires `prepared_chunkwise_inputs`"):
+            sequential(chunk_index=0)
+
+        packed = _chunkwise_forward_contract_model()
+        packed.chunkwise_forward_mode = "packed_flex"
+        with self.assertRaisesRegex(ValueError, "invalid with packed"):
+            packed(prepared_chunkwise_inputs=prepared, chunk_index=0)
+
+    def test_packed_forward_matches_sequential_outputs_gradients_and_batch_padded_ownership(self):
+        def run_model(forward_mode):
+            model = _chunkwise_forward_contract_model()
+            model.chunkwise_forward_mode = forward_mode
+            calls = []
+            model.train_video_scheduler = _RecordingScheduler("video", calls)
+            model.train_action_scheduler = _RecordingScheduler("action", calls)
+            prepared = model.prepare_chunkwise_training_inputs({})
+            captured = {}
+
+            def fake_sparse_mask(*, layout, query_valid, key_valid, state_positions, device, num_heads):
+                del device, num_heads
+                captured["layout"] = layout
+                captured["query_valid"] = query_valid.detach().clone()
+                captured["key_valid"] = key_valid.detach().clone()
+                captured["state_positions"] = (
+                    None if state_positions is None else state_positions.detach().clone()
+                )
+                return PackedBlockSparseMask(
+                    layout=layout,
+                    block_mask=None,
+                    query_valid=query_valid,
+                    key_valid=key_valid,
+                    state_positions=state_positions,
+                )
+
+            if forward_mode == "packed_flex":
+                with mock.patch(
+                    "imagewam.models.backbones.imagewam.build_packed_block_sparse_mask",
+                    side_effect=fake_sparse_mask,
+                ) as sparse_builder:
+                    loss, metrics = model(prepared_chunkwise_inputs=prepared)
+                self.assertEqual(sparse_builder.call_count, 1)
+            else:
+                loss = None
+                metrics = {}
+                for chunk_index in range(model.resolved_chunk_count):
+                    chunk_loss, chunk_metrics = model(
+                        prepared_chunkwise_inputs=prepared,
+                        chunk_index=chunk_index,
+                    )
+                    loss = chunk_loss if loss is None else loss + chunk_loss
+                    for key, value in chunk_metrics.items():
+                        metrics[key] = metrics.get(key, 0.0) + value
+                captured = None
+
+            loss.backward()
+            return loss.detach(), metrics, model.mot.scale.grad.detach().clone(), calls, captured
+
+        torch.manual_seed(1234)
+        sequential_loss, sequential_metrics, sequential_grad, sequential_calls, _ = run_model("sequential")
+        torch.manual_seed(1234)
+        packed_loss, packed_metrics, packed_grad, packed_calls, captured = run_model("packed_flex")
+
+        expected_calls = [
+            "video:sample:1",
+            "video:add:1",
+            "video:target:1",
+            "action:sample:1",
+            "action:add:1",
+            "action:target:1",
+            "video:sample:2",
+            "video:add:2",
+            "video:target:2",
+            "action:sample:2",
+            "action:add:2",
+            "action:target:2",
+        ]
+        self.assertEqual(sequential_calls, expected_calls)
+        self.assertEqual(packed_calls, expected_calls)
+        self.assertTrue(torch.allclose(packed_loss, sequential_loss, atol=1e-6))
+        self.assertTrue(torch.allclose(packed_grad, sequential_grad, atol=1e-6))
+        self.assertAlmostEqual(float(packed_metrics["loss_video"]), float(sequential_metrics["loss_video"]), places=6)
+        self.assertAlmostEqual(float(packed_metrics["loss_action"]), float(sequential_metrics["loss_action"]), places=6)
+        self.assertEqual(packed_metrics["chunk_count"], 2.0)
+        self.assertIn("chunk/0/loss_video", packed_metrics)
+        self.assertIn("chunk/1/loss_video", packed_metrics)
+        self.assertTrue(packed_metrics["chunk/1/loss_video"].requires_grad)
+        self.assertEqual(float(packed_metrics["chunk/1/loss_video"]), 0.0)
+
+        self.assertIsNotNone(captured)
+        layout = captured["layout"]
+        self.assertEqual(layout.sparse_packing, "batch_padded")
+        self.assertEqual(layout.total_token_count, 6)
+        self.assertEqual(captured["query_valid"].tolist(), [[True] * 6, [True] * 6])
+        self.assertEqual(
+            captured["key_valid"].tolist(),
+            [
+                [True, True, True, False, True, True],
+                [True, True, True, False, False, False],
+            ],
+        )
 
     def test_ddp_forward_synchronizes_chunkwise_gradients_across_cpu_ranks(self):
         if not dist.is_available():
