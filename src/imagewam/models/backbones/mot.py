@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .wan_video_dit import modulate, rope_apply
 from .ovis_u1_imports import ensure_ovis_u1_remote_code_importable
+from imagewam.chunkwise import PackedBlockSparseMask, packed_flex_attention
 from imagewam.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -130,6 +131,39 @@ class MoT(nn.Module):
         batch_size, query_len, _ = q_cat.shape
         key_len = k_cat.shape[1]
         H, H_kv, D = self.num_heads, self.num_kv_heads, self.attn_head_dim
+
+        if isinstance(attention_mask, PackedBlockSparseMask):
+            if return_attn_probs:
+                raise RuntimeError(
+                    "Sparse PackedBlockSparseMask attention does not support production "
+                    "attention-probability capture; use explicit dense diagnostics in tests."
+                )
+
+            def _forward_sparse(q_flat: torch.Tensor, k_flat: torch.Tensor, v_flat: torch.Tensor) -> torch.Tensor:
+                q = q_flat.view(batch_size, query_len, H, D).transpose(1, 2)
+                k = k_flat.view(batch_size, key_len, H_kv, D).transpose(1, 2)
+                v = v_flat.view(batch_size, key_len, H_kv, D).transpose(1, 2)
+                enable_gqa = False
+                if H_kv != H and self.gqa_implementation == "repeat":
+                    repeat_factor = H // H_kv
+                    k = k.repeat_interleave(repeat_factor, dim=1)
+                    v = v.repeat_interleave(repeat_factor, dim=1)
+                elif H_kv != H:
+                    enable_gqa = True
+                out = packed_flex_attention(
+                    query=q,
+                    key=k,
+                    value=v,
+                    mask=attention_mask,
+                    scale=D ** -0.5,
+                    enable_gqa=enable_gqa,
+                )
+                return out.transpose(1, 2).reshape(batch_size, query_len, H * D)
+
+            if self.mot_checkpoint_mixed_attn and self.training:
+                return torch.utils.checkpoint.checkpoint(_forward_sparse, q_cat, k_cat, v_cat, use_reentrant=False)
+            return _forward_sparse(q_cat, k_cat, v_cat)
+
         attn_mask = self._format_attention_mask(attention_mask, batch_size, query_len, key_len, q_cat.device)
 
         if return_attn_probs:
