@@ -2739,6 +2739,95 @@ class ImageWAM(torch.nn.Module):
             )
         yield self.training_loss(sample, tiled=tiled)
 
+    def _validate_flux2_chunkwise_prepared_inputs(self, inputs: dict[str, Any]) -> None:
+        if not isinstance(inputs, dict):
+            raise ValueError(
+                f"`prepared_chunkwise_inputs` must be a dict, got {type(inputs)}."
+            )
+        required = {
+            "observations",
+            "text_hidden_states",
+            "text_attention_mask",
+            "action",
+            "action_is_pad",
+            "action_dim_is_pad",
+            "target_valid",
+            "observation_valid",
+            "video_denominator",
+            "action_denominator",
+        }
+        missing = sorted(required.difference(inputs))
+        if missing:
+            raise ValueError(f"`prepared_chunkwise_inputs` missing required keys: {missing}.")
+
+        chunk_count = int(self.resolved_chunk_count)
+        actions_per_chunk = int(self.resolved_actions_per_chunk)
+        expected_action_horizon = chunk_count * actions_per_chunk
+        observations = inputs["observations"]
+        if not isinstance(observations, Sequence) or len(observations) != chunk_count + 1:
+            raise ValueError(
+                "`prepared_chunkwise_inputs['observations']` must contain K+1 entries; "
+                f"got {len(observations) if isinstance(observations, Sequence) else type(observations)} "
+                f"for K={chunk_count}."
+            )
+
+        first_tokens = observations[0].get("tokens") if isinstance(observations[0], dict) else None
+        if not isinstance(first_tokens, torch.Tensor) or first_tokens.ndim < 2:
+            raise ValueError("Every prepared observation requires tensor `tokens` with batch and token dimensions.")
+        batch_size = int(first_tokens.shape[0])
+        for index, observation in enumerate(observations):
+            if not isinstance(observation, dict):
+                raise ValueError(f"Prepared observation {index} must be a dict.")
+            for key in ("tokens", "clean_ids", "target_ids"):
+                value = observation.get(key)
+                if not isinstance(value, torch.Tensor) or value.ndim < 2:
+                    raise ValueError(
+                        f"Prepared observation {index} requires tensor `{key}` with batch and token dimensions."
+                    )
+                if int(value.shape[0]) != batch_size:
+                    raise ValueError(
+                        f"Prepared observation {index} `{key}` batch {value.shape[0]} != {batch_size}."
+                    )
+
+        text_hidden_states = inputs["text_hidden_states"]
+        text_attention_mask = inputs["text_attention_mask"]
+        if not isinstance(text_hidden_states, torch.Tensor) or text_hidden_states.ndim != 3:
+            raise ValueError("`prepared_chunkwise_inputs['text_hidden_states']` must be [B,L,D].")
+        if int(text_hidden_states.shape[0]) != batch_size:
+            raise ValueError("Prepared text batch size must match observations.")
+        if not isinstance(text_attention_mask, torch.Tensor) or tuple(text_attention_mask.shape) != tuple(text_hidden_states.shape[:2]):
+            raise ValueError("`prepared_chunkwise_inputs['text_attention_mask']` must be [B,L].")
+
+        action = inputs["action"]
+        if not isinstance(action, torch.Tensor) or action.ndim != 3:
+            raise ValueError("`prepared_chunkwise_inputs['action']` must be [B,T,D].")
+        if int(action.shape[0]) != batch_size or int(action.shape[1]) != expected_action_horizon:
+            raise ValueError(
+                "`prepared_chunkwise_inputs['action']` must match [B,K*actions_per_chunk,D]; "
+                f"got {tuple(action.shape)} for B={batch_size}, K={chunk_count}, "
+                f"actions_per_chunk={actions_per_chunk}."
+            )
+        action_is_pad = inputs["action_is_pad"]
+        if not isinstance(action_is_pad, torch.Tensor) or tuple(action_is_pad.shape) != tuple(action.shape[:2]):
+            raise ValueError("`prepared_chunkwise_inputs['action_is_pad']` must be [B,T].")
+        action_dim_is_pad = inputs["action_dim_is_pad"]
+        if not isinstance(action_dim_is_pad, torch.Tensor) or tuple(action_dim_is_pad.shape) != (batch_size, int(action.shape[2])):
+            raise ValueError("`prepared_chunkwise_inputs['action_dim_is_pad']` must be [B,D].")
+
+        expected_shapes = {
+            "target_valid": (batch_size, chunk_count),
+            "observation_valid": (batch_size, chunk_count + 1),
+            "video_denominator": (batch_size,),
+            "action_denominator": (batch_size,),
+        }
+        for key, expected_shape in expected_shapes.items():
+            value = inputs[key]
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_shape:
+                raise ValueError(
+                    f"`prepared_chunkwise_inputs['{key}']` must be {expected_shape}, "
+                    f"got {None if not isinstance(value, torch.Tensor) else tuple(value.shape)}."
+                )
+
     def _training_loss_flux2_chunkwise_prepared(
         self,
         inputs: dict[str, Any],
@@ -2753,6 +2842,7 @@ class ImageWAM(torch.nn.Module):
             raise ValueError(
                 f"`chunk_index` must be in [0, {self.resolved_chunk_count}), got {chunk_index}."
             )
+        self._validate_flux2_chunkwise_prepared_inputs(inputs)
         observations = inputs["observations"]
         actions_per_chunk = int(self.resolved_actions_per_chunk)
         target_latent = observations[chunk_index + 1]["tokens"]
@@ -2948,6 +3038,7 @@ class ImageWAM(torch.nn.Module):
                 "G003 implements the selected `batch_padded` packed MoT vertical slice; "
                 f"got sparse_packing={getattr(self, 'chunkwise_sparse_packing', None)!r}."
             )
+        self._validate_flux2_chunkwise_prepared_inputs(inputs)
 
         observations = inputs["observations"]
         actions_per_chunk = int(self.resolved_actions_per_chunk)
