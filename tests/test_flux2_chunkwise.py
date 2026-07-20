@@ -5,7 +5,9 @@ import torch
 
 from imagewam.chunkwise import (
     PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
+    PackedBlockSparseMask,
     build_chunkwise_causal_mask,
+    build_packed_block_sparse_mask,
     build_packed_chunk_layout,
     cache_packed_block_topology,
     chunkwise_loss_contribution,
