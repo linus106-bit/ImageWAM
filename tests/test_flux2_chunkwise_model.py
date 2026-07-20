@@ -304,6 +304,77 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
                 chunkwise_causal={"enabled": True, "num_chunks": 4},
             )
 
+
+    def test_chunkwise_forward_mode_defaults_to_sequential_and_validates_sparse_config(self):
+        sequential = ImageWAM(
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            text_dim=2,
+            stack="flux2",
+            chunkwise_causal={"enabled": True, "num_chunks": 4},
+        )
+        self.assertEqual(sequential.chunkwise_forward_mode, "sequential")
+        self.assertEqual(sequential.chunkwise_sparse_packing, "interleaved")
+        self.assertEqual(sequential.chunkwise_sparse_block_size, 128)
+        self.assertEqual(sequential.chunkwise_sparse_alignment, "none")
+        self.assertTrue(sequential.chunkwise_packed_capability["supported"])
+
+        for bad_config, message in (
+            ({"forward_mode": "bad"}, "forward_mode"),
+            ({"sparse_packing": "auto"}, "sparse_packing"),
+            ({"sparse_block_size": 0}, "sparse_block_size"),
+            ({"sparse_alignment": "auto"}, "sparse_alignment"),
+            ({"packed_layout_schema_version": 999}, "packed_layout_schema_version"),
+        ):
+            config = {"enabled": True, "num_chunks": 4, **bad_config}
+            with self.subTest(config=bad_config), self.assertRaisesRegex(ValueError, message):
+                ImageWAM(
+                    nn.Identity(),
+                    nn.Identity(),
+                    nn.Identity(),
+                    nn.Identity(),
+                    text_dim=2,
+                    stack="flux2",
+                    chunkwise_causal=config,
+                )
+
+    def test_packed_flex_fails_fast_without_cuda_capability(self):
+        with self.assertRaisesRegex(RuntimeError, "requires CUDA"):
+            ImageWAM(
+                nn.Identity(),
+                nn.Identity(),
+                nn.Identity(),
+                nn.Identity(),
+                text_dim=2,
+                stack="flux2",
+                chunkwise_causal={
+                    "enabled": True,
+                    "num_chunks": 4,
+                    "forward_mode": "packed_flex",
+                },
+            )
+
+    def test_k1_forces_sequential_even_with_sparse_settings(self):
+        model = ImageWAM(
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            nn.Identity(),
+            text_dim=2,
+            stack="flux2",
+            chunkwise_causal={
+                "enabled": True,
+                "num_chunks": 1,
+                "forward_mode": "packed_flex",
+                "sparse_packing": "batch_padded",
+                "sparse_alignment": "segment",
+            },
+        )
+        self.assertEqual(model.chunkwise_forward_mode, "sequential")
+        self.assertFalse(model.supports_chunkwise_training_losses)
+
     def test_input_builder_accepts_endpoint_observations_and_uses_temporal_boundaries(self):
         model = _bare_model()
         model.resolved_chunk_count = 4

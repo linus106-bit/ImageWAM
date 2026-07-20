@@ -20,6 +20,10 @@ chunkwise_causal:
   actions_per_chunk: 16
   loss_reduction: mean
   cache_type: observation_prefix
+  forward_mode: sequential
+  sparse_packing: interleaved
+  sparse_block_size: 128
+  sparse_alignment: none
 
 flux2_lora_config:
   enabled: false

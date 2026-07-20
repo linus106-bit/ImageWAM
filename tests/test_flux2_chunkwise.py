@@ -2,8 +2,13 @@ import unittest
 import torch
 
 from imagewam.chunkwise import (
+    PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
     build_chunkwise_causal_mask,
+    build_packed_chunk_layout,
+    cache_packed_block_topology,
     chunkwise_loss_contribution,
+    clear_packed_topology_cache,
+    packed_topology_cache_size,
     resolve_chunkwise_geometry,
 )
 from imagewam.models.backbones.schedulers.scheduler_continuous import (
@@ -89,6 +94,91 @@ class Flux2ChunkwiseTest(unittest.TestCase):
         self.assertTrue(mask[1, :, 3].any())
         self.assertTrue(mask[1, :, 4:6].any())
 
+
+
+    def test_packed_layout_accounts_for_segments_and_alignment(self):
+        layout = build_packed_chunk_layout(
+            chunks=(
+                {
+                    "chunk_ordinal": 0,
+                    "text_length": 3,
+                    "observation_token_lengths": (2,),
+                    "target_length": 1,
+                    "action_length": 2,
+                },
+                {
+                    "chunk_ordinal": 1,
+                    "text_length": 3,
+                    "observation_token_lengths": (2, 2),
+                    "target_length": 1,
+                    "action_length": 2,
+                },
+            ),
+            sparse_block_size=8,
+            sparse_alignment="segment",
+        )
+
+        self.assertEqual(layout.schema_version, PACKED_CHUNK_LAYOUT_SCHEMA_VERSION)
+        self.assertEqual(layout.sparse_packing, "interleaved")
+        self.assertEqual(layout.sparse_alignment, "segment")
+        self.assertEqual(layout.total_token_count, 24)
+        self.assertEqual(layout.segments[0].local_start, 0)
+        self.assertEqual(layout.segments[0].physical_end, 8)
+        self.assertIsNone(layout.segments[0].padding_range)
+        self.assertEqual(layout.segments[1].local_start, 8)
+        self.assertEqual(layout.segments[1].physical_end, 18)
+        self.assertEqual(layout.segments[1].padding_range, (18, 24))
+        self.assertEqual(layout.global_to_local(8), (1, 0, "text"))
+        self.assertEqual(layout.local_to_global(1, 4), 12)
+        self.assertEqual(layout.pattern_owner.count(0), 8)
+        self.assertEqual(layout.pattern_owner.count(1), 16)
+        self.assertIn("segment", layout.signature)
+
+    def test_packed_layout_dense_reference_blocks_cross_pattern_edges(self):
+        layout = build_packed_chunk_layout(
+            chunks=(
+                {
+                    "text_length": 2,
+                    "observation_token_lengths": (1,),
+                    "target_length": 1,
+                    "action_length": 1,
+                },
+                {
+                    "text_length": 2,
+                    "observation_token_lengths": (1,),
+                    "target_length": 1,
+                    "action_length": 1,
+                },
+            ),
+            sparse_block_size=4,
+        )
+        from imagewam.chunkwise import PackedBlockSparseMask
+
+        sparse_mask = PackedBlockSparseMask(layout=layout, block_mask=None)
+        dense = sparse_mask.to_dense_reference(
+            text_attention_masks=(torch.ones(1, 2, dtype=torch.bool),) * 2,
+            clean_observation_valid=(torch.ones(1, 1, dtype=torch.bool),) * 2,
+            target_valid=(torch.ones(1, dtype=torch.bool),) * 2,
+            action_padding_masks=(torch.zeros(1, 1, dtype=torch.bool),) * 2,
+        )[0]
+
+        first = slice(layout.segments[0].local_start, layout.segments[0].physical_end)
+        second = slice(layout.segments[1].local_start, layout.segments[1].physical_end)
+        self.assertFalse(dense[first, second].any())
+        self.assertFalse(dense[second, first].any())
+        self.assertTrue(dense[first, first].any())
+        self.assertTrue(dense[second, second].any())
+
+    def test_packed_topology_cache_is_lru_and_excludes_dynamic_values(self):
+        clear_packed_topology_cache()
+        key = ("cpu", "interleaved", "none", 128, PACKED_CHUNK_LAYOUT_SCHEMA_VERSION, (1, 2, 3))
+        first = object()
+        self.assertIs(cache_packed_block_topology(key, first), first)
+        self.assertIs(cache_packed_block_topology(key, object()), first)
+        for index in range(20):
+            cache_packed_block_topology(("cpu", index), object())
+        self.assertLessEqual(packed_topology_cache_size(), 16)
+        clear_packed_topology_cache()
 
     def test_full_window_denominators_make_chunk_contributions_additive(self):
         video_error = torch.tensor([[4.0, 4.0], [9.0, 9.0]])
