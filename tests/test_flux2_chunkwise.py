@@ -360,6 +360,58 @@ class Flux2ChunkwiseTest(unittest.TestCase):
                 self.assertFalse(dense[:, :, pad_start:pad_end].any())
 
 
+
+    def test_mot_mixed_attention_dispatches_packed_sparse_mask_to_flex_adapter(self):
+        from imagewam.models.backbones import mot as mot_module
+
+        clear_packed_topology_cache()
+        layout = build_packed_chunk_layout(
+            chunks=(
+                {
+                    "text_length": 2,
+                    "observation_token_lengths": (1,),
+                    "target_length": 1,
+                    "action_length": 1,
+                },
+            ),
+            sparse_block_size=4,
+        )
+        sparse = build_packed_block_sparse_mask(
+            layout=layout,
+            query_valid=torch.ones(1, layout.total_token_count, dtype=torch.bool),
+            key_valid=torch.ones(1, layout.total_token_count, dtype=torch.bool),
+            device="cpu",
+            create_block_mask_fn=lambda *args, **kwargs: {"structural": True},
+        )
+        module = mot_module.MoT.__new__(mot_module.MoT)
+        torch.nn.Module.__init__(module)
+        module.num_heads = 2
+        module.num_kv_heads = 2
+        module.attn_head_dim = 3
+        module.gqa_implementation = "repeat"
+        module.mot_checkpoint_mixed_attn = False
+        module.train(False)
+        qkv = torch.randn(1, layout.total_token_count, 6)
+        calls = []
+
+        def fake_packed_flex_attention(**kwargs):
+            calls.append(kwargs)
+            query = kwargs["query"]
+            return torch.zeros_like(query)
+
+        with mock.patch.object(mot_module, "packed_flex_attention", side_effect=fake_packed_flex_attention):
+            out = module._mixed_attention(qkv, qkv, qkv, sparse)
+            with self.assertRaisesRegex(RuntimeError, "attention-probability capture"):
+                module._mixed_attention(qkv, qkv, qkv, sparse, return_attn_probs=True)
+
+        self.assertEqual(tuple(out.shape), tuple(qkv.shape))
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0]["mask"], sparse)
+        self.assertEqual(tuple(calls[0]["query"].shape), (1, 2, layout.total_token_count, 3))
+        self.assertFalse(calls[0]["enable_gqa"])
+        clear_packed_topology_cache()
+
+
     def test_full_window_denominators_make_chunk_contributions_additive(self):
         video_error = torch.tensor([[4.0, 4.0], [9.0, 9.0]])
         action_error = torch.tensor([[1.0, 1.0], [4.0, 4.0]])
