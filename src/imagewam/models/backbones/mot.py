@@ -805,7 +805,6 @@ class MoT(nn.Module):
         img_pe = video_freqs["img"]
         action_ids = context_all["action"]["ids"]
         action_pe = video_expert.transformer.pe_embedder(action_ids.to(device=img.device, dtype=img.dtype))
-        joint_pe = torch.cat([txt_pe, img_pe, action_pe], dim=2)
         video_vec = t_mod_all["video"]
         action_vec = t_mod_all["action"]
         double_layers = int(getattr(video_expert, "double_layers"))
