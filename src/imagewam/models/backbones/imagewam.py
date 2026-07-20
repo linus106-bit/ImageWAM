@@ -2780,13 +2780,20 @@ class ImageWAM(torch.nn.Module):
                 raise ValueError(f"Prepared observation {index} must be a dict.")
             for key in ("tokens", "clean_ids", "target_ids"):
                 value = observation.get(key)
-                if not isinstance(value, torch.Tensor) or value.ndim < 2:
+                if not isinstance(value, torch.Tensor) or value.ndim != 3:
                     raise ValueError(
-                        f"Prepared observation {index} requires tensor `{key}` with batch and token dimensions."
+                        f"Prepared observation {index} requires 3D tensor `{key}` [B,L,D]."
                     )
                 if int(value.shape[0]) != batch_size:
                     raise ValueError(
                         f"Prepared observation {index} `{key}` batch {value.shape[0]} != {batch_size}."
+                    )
+            token_length = int(observation["tokens"].shape[1])
+            for key in ("clean_ids", "target_ids"):
+                if int(observation[key].shape[1]) != token_length:
+                    raise ValueError(
+                        f"Prepared observation {index} `{key}` token length "
+                        f"{observation[key].shape[1]} != tokens length {token_length}."
                     )
 
         text_hidden_states = inputs["text_hidden_states"]
@@ -2810,9 +2817,27 @@ class ImageWAM(torch.nn.Module):
         action_is_pad = inputs["action_is_pad"]
         if not isinstance(action_is_pad, torch.Tensor) or tuple(action_is_pad.shape) != tuple(action.shape[:2]):
             raise ValueError("`prepared_chunkwise_inputs['action_is_pad']` must be [B,T].")
+        if action_is_pad.dtype != torch.bool:
+            raise ValueError("`prepared_chunkwise_inputs['action_is_pad']` must have bool dtype.")
         action_dim_is_pad = inputs["action_dim_is_pad"]
         if not isinstance(action_dim_is_pad, torch.Tensor) or tuple(action_dim_is_pad.shape) != (batch_size, int(action.shape[2])):
             raise ValueError("`prepared_chunkwise_inputs['action_dim_is_pad']` must be [B,D].")
+        if action_dim_is_pad.dtype != torch.bool:
+            raise ValueError("`prepared_chunkwise_inputs['action_dim_is_pad']` must have bool dtype.")
+
+        proprio = inputs.get("proprio")
+        if self.proprio_encoder is not None:
+            expected_proprio_shape = (batch_size, expected_action_horizon)
+            if (
+                not isinstance(proprio, torch.Tensor)
+                or proprio.ndim != 3
+                or tuple(proprio.shape[:2]) != expected_proprio_shape
+            ):
+                raise ValueError(
+                    "`prepared_chunkwise_inputs['proprio']` must be "
+                    f"[B,K*actions_per_chunk,D], got "
+                    f"{None if not isinstance(proprio, torch.Tensor) else tuple(proprio.shape)}."
+                )
 
         expected_shapes = {
             "target_valid": (batch_size, chunk_count),
@@ -2826,6 +2851,15 @@ class ImageWAM(torch.nn.Module):
                 raise ValueError(
                     f"`prepared_chunkwise_inputs['{key}']` must be {expected_shape}, "
                     f"got {None if not isinstance(value, torch.Tensor) else tuple(value.shape)}."
+                )
+        for key in ("target_valid", "observation_valid"):
+            if inputs[key].dtype != torch.bool:
+                raise ValueError(f"`prepared_chunkwise_inputs['{key}']` must have bool dtype.")
+        for key in ("video_denominator", "action_denominator"):
+            value = inputs[key]
+            if not value.is_floating_point() or not bool(torch.isfinite(value).all()) or not bool((value > 0).all()):
+                raise ValueError(
+                    f"`prepared_chunkwise_inputs['{key}']` must contain finite positive floating values."
                 )
 
     def _training_loss_flux2_chunkwise_prepared(
