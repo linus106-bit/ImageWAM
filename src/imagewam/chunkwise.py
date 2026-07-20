@@ -391,10 +391,17 @@ def packed_block_topology_cache_key(
     *,
     device: torch.device | str,
     block_size: int | tuple[int, int] | None = None,
+    num_heads: int | None = None,
 ) -> tuple[Any, ...]:
     """Cache key for structural topology only; excludes current-batch tensors."""
 
-    return (str(torch.device(device)), int(block_size or layout.sparse_block_size), layout.signature)
+    head_key = None if num_heads is None else int(num_heads)
+    return (
+        str(torch.device(device)),
+        int(block_size or layout.sparse_block_size),
+        head_key,
+        layout.signature,
+    )
 
 
 def build_packed_block_sparse_mask(
@@ -438,7 +445,12 @@ def build_packed_block_sparse_mask(
         from torch.nn.attention.flex_attention import create_block_mask as create_block_mask_fn
 
     block_size = int(layout.sparse_block_size)
-    key = packed_block_topology_cache_key(layout, device=target_device, block_size=block_size)
+    key = packed_block_topology_cache_key(
+        layout,
+        device=target_device,
+        block_size=block_size,
+        num_heads=num_heads,
+    )
 
     def _create() -> object:
         return create_block_mask_fn(
