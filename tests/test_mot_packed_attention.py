@@ -49,8 +49,8 @@ def _sparse_mask(seq_len=5, batch_size=1):
 class _VideoDoubleBlock(nn.Module):
     def _prepare_qkv(self, img, txt, _img_pe, _txt_pe, _mod_img, _mod_txt):
         x = torch.cat([txt, img], dim=1)
-        b, l, c = x.shape
-        q = x.view(b, l, 1, c).transpose(1, 2)
+        batch, seq_len, channels = x.shape
+        q = x.view(batch, seq_len, 1, channels).transpose(1, 2)
         return q, q, q, None, int(txt.shape[1]), None
 
     @staticmethod
@@ -60,9 +60,9 @@ class _VideoDoubleBlock(nn.Module):
 
 class _VideoSingleBlock(nn.Module):
     def _qkv(self, x, _mod):
-        b, l, c = x.shape
-        q = x.view(b, l, 1, c).transpose(1, 2)
-        return q, q, q, torch.zeros_like(x), torch.ones(b, 1, c, device=x.device, dtype=x.dtype)
+        batch, seq_len, channels = x.shape
+        q = x.view(batch, seq_len, 1, channels).transpose(1, 2)
+        return q, q, q, torch.zeros_like(x), torch.ones(batch, 1, channels, device=x.device, dtype=x.dtype)
 
     @staticmethod
     def _out(residual, attn, _mlp, _gate):
