@@ -316,7 +316,7 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
             chunkwise_causal={"enabled": True, "num_chunks": 4},
         )
         self.assertEqual(sequential.chunkwise_forward_mode, "sequential")
-        self.assertEqual(sequential.chunkwise_sparse_packing, "interleaved")
+        self.assertEqual(sequential.chunkwise_sparse_packing, "batch_padded")
         self.assertEqual(sequential.chunkwise_sparse_block_size, 128)
         self.assertEqual(sequential.chunkwise_sparse_alignment, "none")
         self.assertTrue(sequential.chunkwise_packed_capability["supported"])

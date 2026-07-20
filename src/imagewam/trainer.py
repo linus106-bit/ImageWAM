@@ -582,6 +582,9 @@ class Wan22Trainer:
         prepared_inputs, expected_count = self._prepare_chunkwise_forward(model, sample)
         if prepared_inputs is None:
             return model(sample)
+        metadata = self._chunkwise_training_metadata(model)
+        if metadata["forward_mode"] == "packed_flex":
+            return model(prepared_chunkwise_inputs=prepared_inputs)
 
         total_loss = None
         loss_metrics = {}
@@ -595,7 +598,7 @@ class Wan22Trainer:
         return total_loss, loss_metrics
 
     def _backward_training_objectives(self, model, sample):
-        """Run one logical batch as K forwards/backwards without retaining graphs."""
+        """Run one logical batch through the configured chunkwise lifecycle."""
         prepare_start = time.perf_counter()
         prepared_inputs, expected_count = self._prepare_chunkwise_forward(model, sample)
         prepare_elapsed = time.perf_counter() - prepare_start
@@ -614,6 +617,22 @@ class Wan22Trainer:
         loss_metrics = {}
         forward_elapsed = prepare_elapsed
         backward_elapsed = 0.0
+        metadata = self._chunkwise_training_metadata(model)
+        if metadata["forward_mode"] == "packed_flex":
+            forward_start = time.perf_counter()
+            with self.accelerator.autocast():
+                objective_loss, objective_metrics = model(
+                    prepared_chunkwise_inputs=prepared_inputs,
+                )
+            forward_elapsed += time.perf_counter() - forward_start
+            detached_loss = objective_loss.detach().float()
+            self._accumulate_loss_metrics(loss_metrics, objective_metrics)
+
+            backward_start = time.perf_counter()
+            self.accelerator.backward(objective_loss)
+            backward_elapsed += time.perf_counter() - backward_start
+            return detached_loss, loss_metrics, forward_elapsed, backward_elapsed
+
         for chunk_index in range(expected_count):
             forward_start = time.perf_counter()
             with self.accelerator.autocast():
