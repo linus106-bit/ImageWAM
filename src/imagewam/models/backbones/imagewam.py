@@ -8,7 +8,11 @@ import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
 
-from imagewam.chunkwise import build_chunkwise_causal_mask, chunkwise_loss_contribution
+from imagewam.chunkwise import (
+    PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
+    build_chunkwise_causal_mask,
+    chunkwise_loss_contribution,
+)
 from imagewam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
@@ -109,6 +113,12 @@ class ImageWAM(torch.nn.Module):
         self.chunkwise_loss_reduction = str(chunkwise["loss_reduction"])
         self.chunkwise_cache_type = str(chunkwise["cache_type"])
         self.cache_type = self.chunkwise_cache_type
+        self.chunkwise_forward_mode = str(chunkwise["forward_mode"])
+        self.chunkwise_sparse_packing = str(chunkwise["sparse_packing"])
+        self.chunkwise_sparse_block_size = int(chunkwise["sparse_block_size"])
+        self.chunkwise_sparse_alignment = str(chunkwise["sparse_alignment"])
+        self.chunkwise_packed_layout_schema_version = int(chunkwise["packed_layout_schema_version"])
+        self.chunkwise_packed_capability = self._validate_chunkwise_forward_capability(chunkwise)
         self.supports_chunkwise_training_losses = (
             self.stack == "flux2"
             and self.chunkwise_causal_enabled
@@ -129,6 +139,11 @@ class ImageWAM(torch.nn.Module):
             "actions_per_chunk": 16,
             "loss_reduction": "mean",
             "cache_type": "observation_prefix",
+            "forward_mode": "sequential",
+            "sparse_packing": "interleaved",
+            "sparse_block_size": 128,
+            "sparse_alignment": "none",
+            "packed_layout_schema_version": PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
         }
         if config is not None:
             if not isinstance(config, dict):
@@ -142,6 +157,11 @@ class ImageWAM(torch.nn.Module):
         resolved["actions_per_chunk"] = int(resolved["actions_per_chunk"])
         resolved["loss_reduction"] = str(resolved["loss_reduction"])
         resolved["cache_type"] = str(resolved["cache_type"])
+        resolved["forward_mode"] = str(resolved["forward_mode"])
+        resolved["sparse_packing"] = str(resolved["sparse_packing"])
+        resolved["sparse_block_size"] = int(resolved["sparse_block_size"])
+        resolved["sparse_alignment"] = str(resolved["sparse_alignment"])
+        resolved["packed_layout_schema_version"] = int(resolved["packed_layout_schema_version"])
         if resolved["num_chunks"] < 1:
             raise ValueError("`chunkwise_causal.num_chunks` must be >= 1.")
         if resolved["actions_per_chunk"] < 1:
@@ -150,11 +170,68 @@ class ImageWAM(torch.nn.Module):
             raise ValueError("Only `chunkwise_causal.loss_reduction=mean` is supported.")
         if resolved["cache_type"] != "observation_prefix":
             raise ValueError("Only `chunkwise_causal.cache_type=observation_prefix` is supported.")
+        if resolved["forward_mode"] not in {"sequential", "packed_flex"}:
+            raise ValueError(
+                "`chunkwise_causal.forward_mode` must be 'sequential' or 'packed_flex', "
+                f"got {resolved['forward_mode']!r}."
+            )
+        if resolved["sparse_packing"] not in {"interleaved", "batch_padded"}:
+            raise ValueError(
+                "`chunkwise_causal.sparse_packing` must be 'interleaved' or 'batch_padded', "
+                f"got {resolved['sparse_packing']!r}."
+            )
+        if resolved["sparse_alignment"] not in {"none", "segment"}:
+            raise ValueError(
+                "`chunkwise_causal.sparse_alignment` must be 'none' or 'segment', "
+                f"got {resolved['sparse_alignment']!r}."
+            )
+        if resolved["sparse_block_size"] <= 0:
+            raise ValueError("`chunkwise_causal.sparse_block_size` must be positive.")
+        if resolved["packed_layout_schema_version"] != PACKED_CHUNK_LAYOUT_SCHEMA_VERSION:
+            raise ValueError(
+                "`chunkwise_causal.packed_layout_schema_version` is incompatible: "
+                f"got {resolved['packed_layout_schema_version']}, "
+                f"expected {PACKED_CHUNK_LAYOUT_SCHEMA_VERSION}."
+            )
         if not resolved["enabled"]:
             resolved["num_chunks"] = 1
+        if resolved["num_chunks"] <= 1:
+            resolved["forward_mode"] = "sequential"
         if str(stack) != "flux2" and resolved["enabled"] and resolved["num_chunks"] > 1:
             raise ValueError("Chunkwise causal training with K > 1 is supported only by the FLUX.2 stack.")
         return resolved
+
+    def _validate_chunkwise_forward_capability(self, chunkwise: dict[str, Any]) -> dict[str, Any]:
+        forward_mode = str(chunkwise["forward_mode"])
+        capability = {
+            "forward_mode": forward_mode,
+            "sparse_packing": str(chunkwise["sparse_packing"]),
+            "sparse_block_size": int(chunkwise["sparse_block_size"]),
+            "sparse_alignment": str(chunkwise["sparse_alignment"]),
+            "packed_layout_schema_version": int(chunkwise["packed_layout_schema_version"]),
+            "torch_version": str(torch.__version__),
+            "cuda_available": bool(torch.cuda.is_available()),
+        }
+        if forward_mode == "sequential":
+            capability["supported"] = True
+            return capability
+        if self.stack != "flux2":
+            raise ValueError("`chunkwise_causal.forward_mode=packed_flex` requires the FLUX.2 stack.")
+        if not bool(chunkwise["enabled"]) or int(chunkwise["num_chunks"]) <= 1:
+            raise ValueError("`chunkwise_causal.forward_mode=packed_flex` requires enabled chunkwise K>1.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("`chunkwise_causal.forward_mode=packed_flex` requires CUDA; no automatic CPU fallback is allowed.")
+        try:
+            from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention  # noqa: F401
+        except Exception as exc:  # pragma: no cover - depends on installed torch build
+            raise RuntimeError(
+                "`chunkwise_causal.forward_mode=packed_flex` requires PyTorch FlexAttention "
+                "(`flex_attention`, `create_block_mask`, `BlockMask`) from torch 2.7."
+            ) from exc
+        capability["supported"] = True
+        capability["flex_attention_importable"] = True
+        capability["cuda_version"] = torch.version.cuda
+        return capability
 
     @classmethod
     def from_wan22_pretrained(
