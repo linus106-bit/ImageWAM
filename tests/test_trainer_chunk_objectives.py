@@ -74,6 +74,10 @@ class _ChunkModel(SimpleNamespace):
         if prepared_chunkwise_inputs is not None:
             if sample is not None:
                 raise ValueError("sample and prepared inputs are mutually exclusive")
+            if self.chunkwise_forward_mode == "packed_flex":
+                if chunk_index is not None:
+                    raise ValueError("chunk_index is invalid for packed inputs")
+                return self.packed_loss_fn()
             if chunk_index is None:
                 raise ValueError("chunk_index is required")
             return self.chunk_loss_fn(int(chunk_index))
@@ -123,6 +127,10 @@ def _chunk_model(losses=(1.0, 2.0, 3.0, 4.0), **overrides):
         }
 
     values["chunk_loss_fn"] = chunk_loss_fn
+    values["packed_loss_fn"] = lambda: (
+        torch.tensor(sum(losses)),
+        {"loss_video": float(sum(losses)), "chunk_count": float(len(losses))},
+    )
     values["training_loss"] = lambda _sample: (torch.tensor(99.0), {"legacy": 1.0})
     return _ChunkModel(**values)
 
@@ -212,6 +220,41 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         self.assertAlmostEqual(metrics["loss_video"], 10.0)
         self.assertAlmostEqual(metrics["chunk_count"], 4.0)
         self.assertAlmostEqual(parameter.item(), 0.0)
+
+    def test_packed_chunk_objective_uses_one_forward_and_one_backward(self):
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        model = _chunk_model(chunkwise_forward_mode="packed_flex")
+
+        def packed_loss_fn():
+            loss = parameter * 10.0
+            return loss, {"loss_video": loss, "chunk_count": 4.0}
+
+        model.packed_loss_fn = packed_loss_fn
+        trainer = _trainer(model)
+        loss, metrics, _, _ = trainer._backward_training_objectives(model, {"batch": 1})
+
+        self.assertEqual(trainer.accelerator.backward_losses, [10.0])
+        self.assertEqual(model.prepared_samples, [{"batch": 1}])
+        self.assertAlmostEqual(loss.item(), 10.0)
+        self.assertAlmostEqual(metrics["loss_video"], 10.0)
+        self.assertAlmostEqual(metrics["chunk_count"], 4.0)
+        self.assertAlmostEqual(parameter.grad.item(), 10.0)
+
+    def test_packed_validation_uses_one_prepared_forward(self):
+        model = _chunk_model(chunkwise_forward_mode="packed_flex")
+        calls = []
+
+        def packed_loss_fn():
+            calls.append("packed")
+            return torch.tensor(10.0), {"loss_video": 10.0, "chunk_count": 4.0}
+
+        model.packed_loss_fn = packed_loss_fn
+        loss, metrics = _trainer(model)._validation_training_loss(model, {"batch": 1})
+
+        self.assertEqual(calls, ["packed"])
+        self.assertEqual(model.prepared_samples, [{"batch": 1}])
+        self.assertAlmostEqual(loss.item(), 10.0)
+        self.assertAlmostEqual(metrics["chunk_count"], 4.0)
 
     def test_chunk_objectives_use_outer_prepared_wrapper_for_every_forward(self):
         parameter = torch.nn.Parameter(torch.tensor(1.0))

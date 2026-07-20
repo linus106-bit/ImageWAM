@@ -11,6 +11,8 @@ from PIL import Image
 from imagewam.chunkwise import (
     PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
     build_chunkwise_causal_mask,
+    build_packed_block_sparse_mask,
+    build_packed_chunk_layout,
     chunkwise_loss_contribution,
 )
 from imagewam.utils.logging_config import get_logger
@@ -140,7 +142,7 @@ class ImageWAM(torch.nn.Module):
             "loss_reduction": "mean",
             "cache_type": "observation_prefix",
             "forward_mode": "sequential",
-            "sparse_packing": "interleaved",
+            "sparse_packing": "batch_padded",
             "sparse_block_size": 128,
             "sparse_alignment": "none",
             "packed_layout_schema_version": PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
@@ -2869,6 +2871,358 @@ class ImageWAM(torch.nn.Module):
             ),
         }
 
+    @staticmethod
+    def _pad_tensor_sequence_dim(
+        tensor: torch.Tensor,
+        *,
+        target_length: int,
+        sequence_dim: int,
+        pad_value: float = 0.0,
+    ) -> torch.Tensor:
+        current = int(tensor.shape[sequence_dim])
+        if current == int(target_length):
+            return tensor
+        if current > int(target_length):
+            raise ValueError(
+                f"Cannot pad sequence dimension {sequence_dim} from {current} down to {target_length}."
+            )
+        pad_shape = list(tensor.shape)
+        pad_shape[sequence_dim] = int(target_length) - current
+        pad = torch.full(
+            tuple(pad_shape),
+            pad_value,
+            device=tensor.device,
+            dtype=tensor.dtype,
+        )
+        return torch.cat([tensor, pad], dim=sequence_dim)
+
+    @classmethod
+    def _compact_flux2_img_to_batch_padded(
+        cls,
+        tensor: torch.Tensor,
+        *,
+        prefix_length: int,
+        max_prefix_length: int,
+        target_length: int,
+    ) -> torch.Tensor:
+        """Convert compact ``[clean-prefix, target]`` tensors to ``[max-prefix, target]``."""
+
+        physical_length = int(prefix_length) + int(target_length)
+        sequence_dim = None
+        for candidate in (1, 2):
+            if tensor.ndim > candidate and int(tensor.shape[candidate]) == physical_length:
+                sequence_dim = candidate
+                break
+        if sequence_dim is None:
+            return tensor
+        prefix = tensor.narrow(sequence_dim, 0, int(prefix_length))
+        target = tensor.narrow(sequence_dim, int(prefix_length), int(target_length))
+        prefix = cls._pad_tensor_sequence_dim(
+            prefix,
+            target_length=int(max_prefix_length),
+            sequence_dim=sequence_dim,
+        )
+        return torch.cat([prefix, target], dim=sequence_dim)
+
+    @staticmethod
+    def _cat_packed_payload(payloads: Sequence[Any]) -> Any:
+        first = payloads[0]
+        if isinstance(first, torch.Tensor):
+            return torch.cat([payload for payload in payloads], dim=0)
+        if isinstance(first, dict):
+            return {
+                key: ImageWAM._cat_packed_payload([payload[key] for payload in payloads])
+                for key in first
+            }
+        return first
+
+    def _training_loss_flux2_chunkwise_packed(self, inputs: dict[str, Any]):
+        if not bool(getattr(self, "supports_chunkwise_prepared_forward", False)):
+            raise RuntimeError(
+                "Packed chunkwise forward requires enabled FLUX.2 chunkwise training with K>1."
+            )
+        if str(getattr(self, "chunkwise_forward_mode", "sequential")) != "packed_flex":
+            raise RuntimeError("Packed chunkwise forward requires `forward_mode=packed_flex`.")
+        if str(getattr(self, "chunkwise_sparse_packing", "batch_padded")) != "batch_padded":
+            raise RuntimeError(
+                "G003 implements the selected `batch_padded` packed MoT vertical slice; "
+                f"got sparse_packing={getattr(self, 'chunkwise_sparse_packing', None)!r}."
+            )
+
+        observations = inputs["observations"]
+        actions_per_chunk = int(self.resolved_actions_per_chunk)
+        chunk_count = int(self.resolved_chunk_count)
+        pattern_records: list[dict[str, Any]] = []
+        max_prefix_length = 0
+        target_length = None
+        action_length = None
+        text_length = None
+        observation_lengths = tuple(int(entry["tokens"].shape[1]) for entry in observations[:-1])
+
+        for chunk_index in range(chunk_count):
+            target_latent = observations[chunk_index + 1]["tokens"]
+            action_start = chunk_index * actions_per_chunk
+            action_end = action_start + actions_per_chunk
+            action = inputs["action"][:, action_start:action_end]
+            action_is_pad = inputs["action_is_pad"][:, action_start:action_end]
+            context, context_mask, state_positions = self._flux2_chunk_context(inputs, chunk_index)
+            batch_size = int(target_latent.shape[0])
+
+            noise_video = torch.randn_like(target_latent)
+            timestep_video = self.train_video_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=target_latent.dtype,
+            )
+            noisy_latent = self.train_video_scheduler.add_noise(
+                target_latent, noise_video, timestep_video
+            )
+            target_video = self.train_video_scheduler.training_target(
+                target_latent, noise_video, timestep_video
+            )
+
+            noise_action = torch.randn_like(action)
+            timestep_action = self.train_action_scheduler.sample_training_t(
+                batch_size=batch_size,
+                device=self.device,
+                dtype=action.dtype,
+            )
+            noisy_action = self.train_action_scheduler.add_noise(
+                action, noise_action, timestep_action
+            )
+            target_action = self.train_action_scheduler.training_target(
+                action, noise_action, timestep_action
+            )
+
+            clean_prefix = observations[: chunk_index + 1]
+            ref_image_latents = torch.cat([entry["tokens"] for entry in clean_prefix], dim=1)
+            ref_img_ids = torch.cat([entry["clean_ids"] for entry in clean_prefix], dim=1)
+            video_pre = self.video_expert.pre_dit(
+                x=noisy_latent,
+                timestep=self._scheduler_timestep_to_unit(
+                    timestep_video, self.train_video_scheduler
+                ),
+                context=context,
+                context_mask=context_mask,
+                ref_image_hidden_states=ref_image_latents,
+                target_img_ids=observations[chunk_index + 1]["target_ids"],
+                ref_img_ids=ref_img_ids,
+            )
+            action_pre = self.action_expert.pre_dit(
+                action_tokens=noisy_action,
+                timestep=self._scheduler_timestep_to_unit(
+                    timestep_action, self.train_action_scheduler
+                ),
+            )
+
+            prefix_length = int(ref_image_latents.shape[1])
+            max_prefix_length = max(max_prefix_length, prefix_length)
+            current_target_length = int(video_pre["target_len"])
+            current_action_length = int(action_pre["tokens"].shape[1])
+            current_text_length = int(video_pre["tokens"]["txt"].shape[1])
+            target_length = current_target_length if target_length is None else target_length
+            action_length = current_action_length if action_length is None else action_length
+            text_length = current_text_length if text_length is None else text_length
+            if current_target_length != int(target_length) or current_action_length != int(action_length):
+                raise ValueError("Packed chunkwise batch_padded requires uniform target/action lengths.")
+            if current_text_length != int(text_length):
+                raise ValueError("Packed chunkwise batch_padded requires uniform text sequence length.")
+
+            pattern_records.append(
+                {
+                    "chunk_index": chunk_index,
+                    "batch_size": batch_size,
+                    "prefix_length": prefix_length,
+                    "video_pre": video_pre,
+                    "action_pre": action_pre,
+                    "target_video": target_video,
+                    "target_action": target_action,
+                    "action_is_pad": action_is_pad,
+                    "timestep_video": timestep_video,
+                    "timestep_action": timestep_action,
+                    "state_positions": state_positions,
+                    "context_mask": context_mask,
+                }
+            )
+
+        assert target_length is not None and action_length is not None and text_length is not None
+        packed_video_pres = []
+        packed_action_pres = []
+        query_valid_rows = []
+        key_valid_rows = []
+        state_position_rows = []
+        total_sequence_length = int(text_length) + int(max_prefix_length) + int(target_length) + int(action_length)
+        for record in pattern_records:
+            video_pre = record["video_pre"]
+            prefix_length = int(record["prefix_length"])
+            padded_img = self._compact_flux2_img_to_batch_padded(
+                video_pre["tokens"]["img"],
+                prefix_length=prefix_length,
+                max_prefix_length=max_prefix_length,
+                target_length=int(target_length),
+            )
+            padded_img_pe = self._compact_flux2_img_to_batch_padded(
+                video_pre["freqs"]["img"],
+                prefix_length=prefix_length,
+                max_prefix_length=max_prefix_length,
+                target_length=int(target_length),
+            )
+            padded_video_pre = {
+                **video_pre,
+                "tokens": {"txt": video_pre["tokens"]["txt"], "img": padded_img},
+                "freqs": {"txt": video_pre["freqs"]["txt"], "img": padded_img_pe},
+                "packed_original_cond_len": int(video_pre["cond_len"]),
+                "packed_cond_len": int(max_prefix_length),
+            }
+            packed_video_pres.append(padded_video_pre)
+            packed_action_pres.append(record["action_pre"])
+
+            batch_size = int(record["batch_size"])
+            chunk_index = int(record["chunk_index"])
+            text_query = record["context_mask"].to(device=self.device, dtype=torch.bool)
+            text_key = text_query.clone()
+            clean_query = torch.zeros(batch_size, int(max_prefix_length), device=self.device, dtype=torch.bool)
+            clean_key = torch.zeros_like(clean_query)
+            cursor = 0
+            for ordinal, obs_len in enumerate(observation_lengths):
+                obs_valid = inputs["observation_valid"][:, ordinal].to(device=self.device, dtype=torch.bool)
+                obs_slice = slice(cursor, cursor + int(obs_len))
+                if ordinal <= chunk_index:
+                    clean_query[:, obs_slice] = True
+                    clean_key[:, obs_slice] = obs_valid[:, None]
+                cursor += int(obs_len)
+            target_query = torch.ones(batch_size, int(target_length), device=self.device, dtype=torch.bool)
+            target_key = inputs["target_valid"][:, chunk_index].to(device=self.device, dtype=torch.bool)[:, None].expand(
+                batch_size, int(target_length)
+            )
+            action_query = torch.ones(batch_size, int(action_length), device=self.device, dtype=torch.bool)
+            action_key = ~record["action_is_pad"].to(device=self.device, dtype=torch.bool)
+            query_valid_rows.append(torch.cat([text_query, clean_query, target_query, action_query], dim=1))
+            key_valid_rows.append(torch.cat([text_key, clean_key, target_key, action_key], dim=1))
+            if record["state_positions"] is not None:
+                state_position_rows.append(record["state_positions"].to(device=self.device, dtype=torch.long))
+
+        layout = build_packed_chunk_layout(
+            chunks=(
+                {
+                    "text_length": int(text_length),
+                    "observation_token_lengths": observation_lengths,
+                    "target_length": int(target_length),
+                    "action_length": int(action_length),
+                    "chunk_ordinal": 0,
+                },
+            ),
+            sparse_packing="batch_padded",
+            sparse_alignment=str(getattr(self, "chunkwise_sparse_alignment", "none")),
+            sparse_block_size=int(getattr(self, "chunkwise_sparse_block_size", 128)),
+        )
+        query_valid = torch.cat(query_valid_rows, dim=0)
+        key_valid = torch.cat(key_valid_rows, dim=0)
+        if int(layout.total_token_count) != total_sequence_length:
+            raise RuntimeError(
+                "Packed layout length mismatch: "
+                f"layout={layout.total_token_count}, expected={total_sequence_length}."
+            )
+        state_positions = torch.cat(state_position_rows, dim=0) if state_position_rows else None
+        sparse_mask = build_packed_block_sparse_mask(
+            layout=layout,
+            query_valid=query_valid,
+            key_valid=key_valid,
+            state_positions=state_positions,
+            device=self.device,
+            num_heads=int(getattr(self.mot, "num_heads", 1)),
+        )
+        packed_tokens_out = self.mot(
+            embeds_all={
+                "video": {
+                    "txt": torch.cat([pre["tokens"]["txt"] for pre in packed_video_pres], dim=0),
+                    "img": torch.cat([pre["tokens"]["img"] for pre in packed_video_pres], dim=0),
+                },
+                "action": torch.cat([pre["tokens"] for pre in packed_action_pres], dim=0),
+            },
+            attention_mask={"double_joint": sparse_mask, "single": sparse_mask},
+            freqs_all={
+                "video": {
+                    "txt": torch.cat([pre["freqs"]["txt"] for pre in packed_video_pres], dim=0),
+                    "img": torch.cat([pre["freqs"]["img"] for pre in packed_video_pres], dim=0),
+                },
+            },
+            context_all={"video": None, "action": {"ids": torch.cat([pre["ids"] for pre in packed_action_pres], dim=0)}},
+            t_mod_all={
+                "video": self._cat_packed_payload([pre["t_mod"] for pre in packed_video_pres]),
+                "action": self._cat_packed_payload([pre["t_mod"] for pre in packed_action_pres]),
+            },
+        )
+
+        loss_total = None
+        aggregate_metrics: dict[str, float] = {
+            "loss_video": 0.0,
+            "loss_action": 0.0,
+            "chunk_count": 0.0,
+            "packed/sparse_packing": 1.0,
+            "packed/attention_sequence_length": float(layout.total_token_count),
+        }
+        row_start = 0
+        for record in pattern_records:
+            batch_size = int(record["batch_size"])
+            row_end = row_start + batch_size
+            prefix_length = int(record["prefix_length"])
+            chunk_index = int(record["chunk_index"])
+            video_out = packed_tokens_out["video"]
+            img_out = video_out["img"][row_start:row_end]
+            compact_img = torch.cat(
+                [
+                    img_out[:, :prefix_length],
+                    img_out[:, int(max_prefix_length) : int(max_prefix_length) + int(target_length)],
+                ],
+                dim=1,
+            )
+            compact_video_out = {
+                "txt": video_out["txt"][row_start:row_end],
+                "img": compact_img,
+            }
+            action_out = packed_tokens_out["action"][row_start:row_end]
+            video_pre = record["video_pre"]
+            action_pre = record["action_pre"]
+            pred_video = self.video_expert.post_dit(compact_video_out, video_pre)
+            pred_action = self.action_expert.post_dit(action_out, action_pre)
+            video_squared_error = F.mse_loss(
+                pred_video.float(), record["target_video"].float(), reduction="none"
+            )
+            action_squared_error = F.mse_loss(
+                pred_action.float(), record["target_action"].float(), reduction="none"
+            )
+            action_valid = (~record["action_is_pad"])[:, :, None] & (
+                ~inputs["action_dim_is_pad"]
+            )[:, None, :]
+            action_squared_error = action_squared_error * action_valid.to(
+                device=action_squared_error.device, dtype=action_squared_error.dtype
+            )
+            loss, components = chunkwise_loss_contribution(
+                video_squared_error=video_squared_error,
+                action_squared_error=action_squared_error,
+                valid_target=inputs["target_valid"][:, chunk_index],
+                video_weight=self.train_video_scheduler.training_weight(record["timestep_video"]),
+                action_weight=self.train_action_scheduler.training_weight(record["timestep_action"]),
+                video_denominator=inputs["video_denominator"],
+                action_denominator=inputs["action_denominator"],
+                lambda_video=self.loss_lambda_video,
+                lambda_action=self.loss_lambda_action,
+            )
+            loss_total = loss if loss_total is None else loss_total + loss
+            loss_video = components["loss_video"]
+            loss_action = components["loss_action"]
+            aggregate_metrics["loss_video"] += loss_video
+            aggregate_metrics["loss_action"] += loss_action
+            aggregate_metrics["chunk_count"] += 1.0
+            aggregate_metrics[f"chunk/{chunk_index}/loss_video"] = loss_video
+            aggregate_metrics[f"chunk/{chunk_index}/loss_action"] = loss_action
+            aggregate_metrics[f"chunk/{chunk_index}/observation_prefix_tokens"] = float(prefix_length)
+            aggregate_metrics[f"chunk/{chunk_index}/attention_sequence_length"] = float(layout.total_token_count)
+            row_start = row_end
+        assert loss_total is not None
+        return loss_total, aggregate_metrics
+
     def _training_loss_flux2(self, sample, tiled: bool = False):
         inputs = self.build_inputs_flux2(sample, tiled=tiled)
         target_latent = inputs["target_latent"]
@@ -4940,8 +5294,13 @@ class ImageWAM(torch.nn.Module):
         if prepared_chunkwise_inputs is not None:
             if sample is not None:
                 raise ValueError("`sample` and `prepared_chunkwise_inputs` are mutually exclusive.")
+            forward_mode = str(getattr(self, "chunkwise_forward_mode", "sequential"))
+            if forward_mode == "packed_flex":
+                if chunk_index is not None:
+                    raise ValueError("`chunk_index` is invalid with packed prepared chunkwise inputs.")
+                return self._training_loss_flux2_chunkwise_packed(prepared_chunkwise_inputs)
             if chunk_index is None:
-                raise ValueError("`chunk_index` is required with `prepared_chunkwise_inputs`.")
+                raise ValueError("`chunk_index` is required with sequential prepared chunkwise inputs.")
             return self._training_loss_flux2_chunkwise_prepared(
                 prepared_chunkwise_inputs,
                 chunk_index,
