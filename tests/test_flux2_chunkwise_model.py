@@ -642,6 +642,45 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target_valid"):
             packed(prepared_chunkwise_inputs=malformed)
 
+    def test_prepared_forward_rejects_malformed_packed_tensor_contracts(self):
+        model = _chunkwise_forward_contract_model()
+        prepared = model.prepare_chunkwise_training_inputs({})
+
+        malformed_ids = {
+            **prepared,
+            "observations": [dict(observation) for observation in prepared["observations"]],
+        }
+        malformed_ids["observations"][0]["clean_ids"] = torch.zeros(1, 2, 4)
+        with self.assertRaisesRegex(ValueError, "clean_ids.*token length"):
+            model._validate_flux2_chunkwise_prepared_inputs(malformed_ids)
+
+        for key in ("action_is_pad", "action_dim_is_pad", "target_valid", "observation_valid"):
+            malformed_mask = {**prepared, key: prepared[key].float()}
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "bool dtype"):
+                model._validate_flux2_chunkwise_prepared_inputs(malformed_mask)
+
+        for key, value in (
+            ("video_denominator", torch.tensor([0.0])),
+            ("action_denominator", torch.tensor([float("nan")])),
+        ):
+            malformed_denominator = {**prepared, key: value}
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "finite positive"):
+                model._validate_flux2_chunkwise_prepared_inputs(malformed_denominator)
+
+    def test_prepared_forward_requires_proprio_geometry_when_encoder_is_enabled(self):
+        model = _chunkwise_forward_contract_model()
+        prepared = model.prepare_chunkwise_training_inputs({})
+        model.proprio_encoder = nn.Linear(3, 2)
+
+        with self.assertRaisesRegex(ValueError, "proprio"):
+            model._validate_flux2_chunkwise_prepared_inputs(prepared)
+        malformed = {**prepared, "proprio": torch.zeros(1, 1, 3)}
+        with self.assertRaisesRegex(ValueError, "proprio"):
+            model._validate_flux2_chunkwise_prepared_inputs(malformed)
+
+        valid = {**prepared, "proprio": torch.zeros(1, 2, 3)}
+        model._validate_flux2_chunkwise_prepared_inputs(valid)
+
     def test_packed_forward_matches_sequential_outputs_gradients_and_batch_padded_ownership(self):
         def run_model(forward_mode):
             model = _chunkwise_forward_contract_model()

@@ -188,6 +188,20 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "prepare_chunkwise_training_inputs"):
             trainer._prepare_chunkwise_forward(missing_prepare, {})
 
+    def test_prepare_chunkwise_forward_strictly_validates_mode_sample_and_prepared_result(self):
+        trainer = _trainer()
+        with self.assertRaisesRegex(ValueError, "forward_mode"):
+            trainer._prepare_chunkwise_forward(
+                _chunk_model(chunkwise_forward_mode="packed_typo"), {}
+            )
+        with self.assertRaisesRegex(ValueError, "dict sample"):
+            trainer._prepare_chunkwise_forward(_chunk_model(), object())
+
+        malformed = _chunk_model()
+        malformed.prepare_chunkwise_training_inputs = lambda _sample: []
+        with self.assertRaisesRegex(ValueError, "must return a dict"):
+            trainer._prepare_chunkwise_forward(malformed, {})
+
     def test_inconsistent_or_non_flux_k_greater_than_one_fails_safe(self):
         trainer = _trainer()
         with self.assertRaisesRegex(ValueError, "chunkwise_enabled=True"):
@@ -309,6 +323,9 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         trainer.accelerator.distributed_type = "FSDP"
         with self.assertRaisesRegex(RuntimeError, "not supported"):
             trainer._validate_chunkwise_distributed_contract()
+        trainer.accelerator.distributed_type = "TPU"
+        with self.assertRaisesRegex(RuntimeError, "not supported"):
+            trainer._validate_chunkwise_distributed_contract()
         trainer.accelerator.distributed_type = "DEEPSPEED"
 
         trainer.accelerator.state.deepspeed_plugin = SimpleNamespace(
@@ -353,6 +370,7 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
             self.assertIn("torch_major_minor", payload)
             self.assertIs(payload["supports_chunkwise_training_losses"], True)
             trainer._validate_resume_chunkwise_metadata(payload, tmp_dir)
+            self.assertEqual(list(Path(tmp_dir).glob(".trainer_state.json.*.tmp")), [])
 
     def test_canonical_model_metadata_wins_over_legacy_aliases(self):
         model = _chunk_model(chunkwise_enabled=False, cache_type="legacy-cache")
@@ -390,6 +408,24 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
             chunkwise_causal_enabled=False,
         )
         _trainer(model)._validate_resume_chunkwise_metadata({"global_step": 1}, "legacy-state")
+
+    def test_resume_rejects_invalid_progress_before_loading_accelerator_state(self):
+        trainer = _trainer(_chunk_model())
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            payload = trainer._chunkwise_training_metadata()
+            payload["global_step"] = -1
+            (Path(tmp_dir) / "trainer_state.json").write_text(json.dumps(payload))
+
+            with self.assertRaisesRegex(ValueError, "global_step"):
+                trainer.load_training_state(tmp_dir)
+
+        self.assertEqual(trainer.accelerator.loaded, [])
+
+    def test_resume_requires_epoch_and_batch_progress_as_a_pair(self):
+        trainer = _trainer(_chunk_model())
+        payload = {**trainer._chunkwise_training_metadata(), "global_step": 1, "epoch": 2}
+        with self.assertRaisesRegex(ValueError, "both `epoch` and `batch_in_epoch`"):
+            trainer._validate_trainer_state_progress(payload, "partial-progress")
 
 
 if __name__ == "__main__":
