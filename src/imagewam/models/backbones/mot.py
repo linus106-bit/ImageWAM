@@ -191,7 +191,6 @@ class MoT(nn.Module):
             except Exception as exc:  # pragma: no cover - depends on torch build
                 raise RuntimeError("`force_flash_attention=True` requires torch.nn.attention.sdpa_kernel.") from exc
             return sdpa_kernel([SDPBackend.FLASH_ATTENTION])
-            force_flash_context = sdpa_kernel([SDPBackend.FLASH_ATTENTION])
 
         def _forward(q_flat: torch.Tensor, k_flat: torch.Tensor, v_flat: torch.Tensor) -> torch.Tensor:
             q = q_flat.view(batch_size, query_len, H, D).transpose(1, 2)
@@ -807,9 +806,6 @@ class MoT(nn.Module):
         action_ids = context_all["action"]["ids"]
         action_pe = video_expert.transformer.pe_embedder(action_ids.to(device=img.device, dtype=img.dtype))
         joint_pe = torch.cat([txt_pe, img_pe, action_pe], dim=2)
-        image_pe = torch.cat([img_pe, action_pe], dim=2)
-        single_pe = joint_pe
-
         video_vec = t_mod_all["video"]
         action_vec = t_mod_all["action"]
         double_layers = int(getattr(video_expert, "double_layers"))
