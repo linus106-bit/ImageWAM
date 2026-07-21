@@ -208,7 +208,7 @@ loss, metrics = prepared_model(prepared_chunkwise_inputs=prepared)
 accelerator.backward(loss)
 ```
 
-현재 선택된 packing은 `batch_padded`다. 각 `(batch, chunk-pattern)` row는 독립된 token sequence를 가지며, 모든 MoT layer는 ImageWAM 소유 `PackedBlockSparseMask`를 통해 한 번 호출된다. cached topology는 structural layout만 보유하고, 현재 batch의 query/key validity와 state position은 매 forward immutable snapshot으로 전달한다. Production packed path는 dense `[B,L,L]` mask를 만들지 않는다.
+현재 선택된 packing은 DreamZero-style `interleaved`다. 각 chunk는 독립적인 diffusion timestep/AdaLN conditioning으로 Q/K/V를 만든 뒤 sequence 축으로 합쳐지고, 모든 MoT layer는 ImageWAM 소유 `PackedBlockSparseMask`를 통해 한 번 호출된다. Chunk `i`의 noisy target/action은 canonical instruction, clean observation `O0..Oi`, 같은 chunk의 target/action/state에만 접근한다. Clean `Oi`는 instruction과 `O0..Oi`에만 접근하고 state query는 self-only다. 중복 prefix token은 physical segment에는 남지만 dynamic validity가 canonical key만 선택한다. Cached topology는 structural layout만 보유하고, 현재 batch의 query/key validity와 chunk별 state position은 매 forward immutable snapshot으로 전달한다. Production packed path는 dense `[B,L,L]` mask를 만들지 않는다.
 
 | Mode | Outer forward / logical microbatch | Backward | 용도 |
 |---|---:|---:|---|
@@ -374,7 +374,7 @@ tests/test_flux2_chunkwise_benchmark.py
 - [x] Multi-observation input/ID/action/state helper를 구현한다.
 - [x] Per-example offset 기반 chunk causal mask를 구현한다.
 - [x] Exact denominator 기반 sequential loss iterator를 구현한다.
-- [x] Packed `batch_padded` sparse mask/MoT/objective 경로를 구현한다.
+- [x] DreamZero-style `interleaved` cross-chunk sparse mask/MoT/objective 경로를 구현한다.
 - [x] Trainer의 sequential multi-backward와 packed one-backward 경로를 연결한다.
 - [x] Checkpoint metadata와 resume validation을 추가한다.
 - [x] CPU unit/model/trainer/DDP/Accelerate 검증을 추가한다.
@@ -398,7 +398,7 @@ Base config는 성능 gate가 증명되기 전까지 다음을 유지한다.
 ```yaml
 chunkwise_causal:
   forward_mode: sequential
-  sparse_packing: batch_padded
+  sparse_packing: interleaved
 ```
 
 CUDA 없이 환경·task geometry·스키마와 default 결정을 기록한다.

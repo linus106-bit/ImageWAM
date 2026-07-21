@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from imagewam.chunkwise import PACKED_CHUNK_LAYOUT_SCHEMA_VERSION
+
 
 BENCHMARK_SCHEMA_VERSION = 1
 BENCHMARK_NAME = "block-sparse-packed-chunk-forward"
@@ -147,10 +149,12 @@ def resolve_task_spec(repo_root: Path, task_config: str) -> dict[str, Any]:
         "total_action_horizon": int(chunkwise["num_chunks"])
         * int(chunkwise["actions_per_chunk"]),
         "forward_mode_default": str(chunkwise.get("forward_mode", "sequential")),
-        "sparse_packing": str(chunkwise.get("sparse_packing", "batch_padded")),
+        "sparse_packing": str(chunkwise.get("sparse_packing", "interleaved")),
         "sparse_block_size": int(chunkwise.get("sparse_block_size", 128)),
         "sparse_alignment": str(chunkwise.get("sparse_alignment", "none")),
-        "layout_schema_version": int(chunkwise.get("packed_layout_schema_version", 1)),
+        "layout_schema_version": int(
+            chunkwise.get("packed_layout_schema_version", PACKED_CHUNK_LAYOUT_SCHEMA_VERSION)
+        ),
     }
 
 

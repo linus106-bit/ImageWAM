@@ -43,10 +43,10 @@ def _completed_result(task_config: str, candidate: str) -> dict:
             "actions_per_chunk": 16,
             "total_action_horizon": 64,
             "forward_mode_default": "sequential",
-            "sparse_packing": "batch_padded",
+            "sparse_packing": "interleaved",
             "sparse_block_size": 128,
             "sparse_alignment": "none",
-            "layout_schema_version": 1,
+            "layout_schema_version": 2,
         },
         "runtime": {
             "torch": "2.7.1",
@@ -167,7 +167,8 @@ class BenchmarkProtocolTests(unittest.TestCase):
                 self.assertEqual(spec["batch_size"], expected_batch)
                 self.assertEqual(spec["gradient_accumulation_steps"], expected_accumulation)
                 self.assertEqual(spec["forward_mode_default"], "sequential")
-                self.assertEqual(spec["sparse_packing"], "batch_padded")
+                self.assertEqual(spec["sparse_packing"], "interleaved")
+                self.assertEqual(spec["layout_schema_version"], 2)
 
 
 class BenchmarkResultTests(unittest.TestCase):

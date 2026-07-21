@@ -121,6 +121,84 @@ def _fake_mot():
 
 
 class MoTPackedAttentionTest(unittest.TestCase):
+    def test_flux2_interleaved_calls_one_cross_chunk_attention_per_layer(self):
+        module = _fake_mot()
+        clear_packed_topology_cache()
+        layout = build_packed_chunk_layout(
+            chunks=(
+                {
+                    "text_length": 2,
+                    "observation_token_lengths": (1,),
+                    "target_length": 1,
+                    "action_length": 1,
+                },
+                {
+                    "text_length": 2,
+                    "observation_token_lengths": (1,),
+                    "target_length": 1,
+                    "action_length": 1,
+                },
+            ),
+            sparse_packing="interleaved",
+            sparse_block_size=4,
+        )
+        mask = build_packed_block_sparse_mask(
+            layout=layout,
+            query_valid=torch.ones(1, layout.total_token_count, dtype=torch.bool),
+            key_valid=torch.ones(1, layout.total_token_count, dtype=torch.bool),
+            device="cpu",
+            create_block_mask_fn=lambda *_args, **_kwargs: {"structural": True},
+        )
+
+        video_pre_states = []
+        action_pre_states = []
+        source_shapes = []
+        for _index in range(2):
+            txt = torch.randn(1, 2, 3)
+            img = torch.randn(1, 2, 3)
+            action = torch.randn(1, 1, 3)
+            source_shapes.append((tuple(txt.shape), tuple(img.shape), tuple(action.shape)))
+            video_pre_states.append(
+                {
+                    "tokens": {"txt": txt, "img": img},
+                    "freqs": {
+                        "txt": torch.zeros(1, 1, 2, 1),
+                        "img": torch.zeros(1, 1, 2, 1),
+                    },
+                    "t_mod": {"double_img": None, "double_txt": None, "single": None},
+                }
+            )
+            action_pre_states.append(
+                {
+                    "tokens": action,
+                    "ids": torch.zeros(1, 1, 1),
+                    "t_mod": {"double_img": None, "single": None},
+                }
+            )
+
+        calls = []
+
+        def fake_attention(q_cat, _k_cat, _v_cat, attention_mask, return_attn_probs=False):
+            self.assertFalse(return_attn_probs)
+            calls.append((tuple(q_cat.shape), attention_mask))
+            return q_cat
+
+        with mock.patch.object(module, "_mixed_attention", side_effect=fake_attention):
+            outputs = module.forward_flux2_interleaved(
+                video_pre_states=video_pre_states,
+                action_pre_states=action_pre_states,
+                attention_mask={"double_joint": mask, "single": mask},
+            )
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([shape for shape, _mask in calls], [(1, 10, 3)] * 3)
+        self.assertTrue(all(call_mask is mask for _shape, call_mask in calls))
+        self.assertEqual(len(outputs), 2)
+        for output, (txt_shape, img_shape, action_shape) in zip(outputs, source_shapes, strict=True):
+            self.assertEqual(tuple(output["video"]["txt"].shape), txt_shape)
+            self.assertEqual(tuple(output["video"]["img"].shape), img_shape)
+            self.assertEqual(tuple(output["action"].shape), action_shape)
+
     def test_flux2_forward_calls_sparse_attention_once_per_double_and_single_layer(self):
         module = _fake_mot()
         mask = _sparse_mask(seq_len=5, batch_size=2)

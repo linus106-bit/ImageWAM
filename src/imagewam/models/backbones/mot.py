@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -641,6 +641,195 @@ class MoT(nn.Module):
         txt_len = int(txt.shape[1])
         txt, img = video_stream[:, :txt_len], video_stream[:, txt_len:]
         return {"video": {"txt": txt, "img": img}, "action": action}
+
+    def forward_flux2_interleaved(
+        self,
+        *,
+        video_pre_states: Sequence[dict[str, Any]],
+        action_pre_states: Sequence[dict[str, Any]],
+        attention_mask: dict[str, PackedBlockSparseMask],
+    ) -> list[dict[str, Any]]:
+        """Run DreamZero-style cross-chunk attention once per FLUX.2 layer.
+
+        Chunk-specific AdaLN/timestep conditioning is applied before packing QKV.
+        The resulting chunk segments are concatenated on the sequence axis for one
+        sparse attention call, then split back before each expert's residual path.
+        """
+
+        if self.block_protocol != "flux2":
+            raise ValueError("Cross-chunk interleaved execution requires block_protocol='flux2'.")
+        if not video_pre_states or len(video_pre_states) != len(action_pre_states):
+            raise ValueError("Cross-chunk FLUX.2 execution requires matching non-empty pre-state lists.")
+        if not isinstance(attention_mask, dict):
+            raise ValueError("Cross-chunk FLUX.2 expects attention_mask={'double_joint', 'single'}.")
+        if not all(isinstance(attention_mask.get(key), PackedBlockSparseMask) for key in ("double_joint", "single")):
+            raise TypeError("Cross-chunk FLUX.2 requires PackedBlockSparseMask for both attention stages.")
+        double_mask = attention_mask["double_joint"]
+        single_mask = attention_mask["single"]
+        if double_mask.layout.signature != single_mask.layout.signature:
+            raise ValueError("Cross-chunk FLUX.2 attention stages must share one packed layout.")
+        if double_mask.layout.sparse_packing != "interleaved":
+            raise ValueError("Cross-chunk FLUX.2 requires sparse_packing='interleaved'.")
+        if len(double_mask.layout.segments) != len(video_pre_states):
+            raise ValueError("Cross-chunk FLUX.2 requires one packed segment per pre-state pair.")
+
+        video_expert = self.mixtures["video"]
+        action_expert = self.mixtures["action"]
+        txt_states = [pre["tokens"]["txt"] for pre in video_pre_states]
+        img_states = [pre["tokens"]["img"] for pre in video_pre_states]
+        action_states = [pre["tokens"] for pre in action_pre_states]
+        batch_sizes = {int(tensor.shape[0]) for tensor in (*txt_states, *img_states, *action_states)}
+        if len(batch_sizes) != 1:
+            raise ValueError("Every cross-chunk segment must share one logical batch size.")
+        actual_lengths = tuple(
+            int(txt.shape[1] + img.shape[1] + action.shape[1])
+            for txt, img, action in zip(txt_states, img_states, action_states, strict=True)
+        )
+        expected_lengths = tuple(segment.physical_length for segment in double_mask.layout.segments)
+        if actual_lengths != expected_lengths or sum(actual_lengths) != double_mask.layout.total_token_count:
+            raise ValueError(
+                "Cross-chunk FLUX.2 pre-state lengths must exactly match the unpadded packed layout; "
+                f"got {actual_lengths}, expected {expected_lengths}."
+            )
+
+        action_pes = []
+        for pre, action in zip(action_pre_states, action_states, strict=True):
+            action_ids = pre["ids"]
+            action_pes.append(
+                video_expert.transformer.pe_embedder(action_ids.to(device=action.device, dtype=action.dtype))
+            )
+
+        from flux2.model import apply_rope
+
+        for layer_idx in range(int(getattr(video_expert, "double_layers"))):
+            v_block = video_expert.double_blocks[layer_idx]
+            a_block = action_expert.double_blocks[layer_idx]
+            packed_q = []
+            packed_k = []
+            packed_v = []
+            segment_states = []
+            segment_lengths = []
+            for index, (video_pre, action_pre) in enumerate(
+                zip(video_pre_states, action_pre_states, strict=True)
+            ):
+                txt = txt_states[index]
+                img = img_states[index]
+                action = action_states[index]
+                q, k, v, pe_full, num_txt_tokens, mods = v_block._prepare_qkv(
+                    img,
+                    txt,
+                    video_pre["freqs"]["img"],
+                    video_pre["freqs"]["txt"],
+                    video_pre["t_mod"]["double_img"],
+                    video_pre["t_mod"]["double_txt"],
+                )
+                q, k = apply_rope(q, k, pe_full)
+                action_state = a_block.prepare_qkv(
+                    action,
+                    action_pes[index],
+                    action_pre["t_mod"]["double_img"],
+                )
+                video_q = self._flux2_flatten_heads(q)
+                video_k = self._flux2_flatten_heads(k)
+                video_v = self._flux2_flatten_heads(v)
+                packed_q.append(torch.cat([video_q, action_state["q"]], dim=1))
+                packed_k.append(torch.cat([video_k, action_state["k"]], dim=1))
+                packed_v.append(torch.cat([video_v, action_state["v"]], dim=1))
+                segment_lengths.append(int(txt.shape[1] + img.shape[1] + action.shape[1]))
+                segment_states.append((num_txt_tokens, mods, action_state))
+
+            mixed = self._mixed_attention(
+                torch.cat(packed_q, dim=1),
+                torch.cat(packed_k, dim=1),
+                torch.cat(packed_v, dim=1),
+                attention_mask["double_joint"],
+            )
+            for index, segment_out in enumerate(torch.split(mixed, segment_lengths, dim=1)):
+                txt = txt_states[index]
+                img = img_states[index]
+                action = action_states[index]
+                num_txt_tokens, mods, action_state = segment_states[index]
+                video_len = int(txt.shape[1] + img.shape[1])
+                video_attn, action_attn = torch.split(
+                    segment_out, [video_len, int(action.shape[1])], dim=1
+                )
+                txt_attn, img_attn = torch.split(
+                    video_attn, [int(num_txt_tokens), int(img.shape[1])], dim=1
+                )
+                img_states[index], txt_states[index] = v_block._apply_residuals(
+                    img, txt, img_attn, txt_attn, mods
+                )
+                action_states[index] = a_block.apply_post(action_attn, action_state)
+
+        video_streams = [
+            torch.cat([txt, img], dim=1)
+            for txt, img in zip(txt_states, img_states, strict=True)
+        ]
+        stream_pes = [
+            torch.cat([pre["freqs"]["txt"], pre["freqs"]["img"]], dim=2)
+            for pre in video_pre_states
+        ]
+        for layer_idx in range(int(getattr(video_expert, "single_layers"))):
+            v_block = video_expert.single_blocks[layer_idx]
+            a_block = action_expert.single_blocks[layer_idx]
+            packed_q = []
+            packed_k = []
+            packed_v = []
+            segment_states = []
+            segment_lengths = []
+            for index, (video_pre, action_pre) in enumerate(
+                zip(video_pre_states, action_pre_states, strict=True)
+            ):
+                video_state = self._flux2_video_single_io(
+                    v_block,
+                    video_streams[index],
+                    stream_pes[index],
+                    video_pre["t_mod"]["single"],
+                )
+                action_state = a_block.prepare_qkv(
+                    action_states[index],
+                    action_pes[index],
+                    action_pre["t_mod"]["single"],
+                )
+                packed_q.append(torch.cat([video_state["q"], action_state["q"]], dim=1))
+                packed_k.append(torch.cat([video_state["k"], action_state["k"]], dim=1))
+                packed_v.append(torch.cat([video_state["v"], action_state["v"]], dim=1))
+                segment_lengths.append(int(video_streams[index].shape[1] + action_states[index].shape[1]))
+                segment_states.append((video_state, action_state))
+
+            mixed = self._mixed_attention(
+                torch.cat(packed_q, dim=1),
+                torch.cat(packed_k, dim=1),
+                torch.cat(packed_v, dim=1),
+                attention_mask["single"],
+            )
+            for index, segment_out in enumerate(torch.split(mixed, segment_lengths, dim=1)):
+                video_len = int(video_streams[index].shape[1])
+                video_attn, action_attn = torch.split(
+                    segment_out, [video_len, int(action_states[index].shape[1])], dim=1
+                )
+                video_state, action_state = segment_states[index]
+                video_streams[index] = v_block._out(
+                    video_state["residual_x"],
+                    video_attn,
+                    video_state["mlp"],
+                    video_state["gate"],
+                )
+                action_states[index] = a_block.apply_post(action_attn, action_state)
+
+        outputs = []
+        for index, video_stream in enumerate(video_streams):
+            txt_len = int(txt_states[index].shape[1])
+            outputs.append(
+                {
+                    "video": {
+                        "txt": video_stream[:, :txt_len],
+                        "img": video_stream[:, txt_len:],
+                    },
+                    "action": action_states[index],
+                }
+            )
+        return outputs
 
     def prefill_flux2_video_cache(
         self,

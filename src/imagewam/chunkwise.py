@@ -6,7 +6,7 @@ from typing import Any, Callable, Literal, Sequence
 
 import torch
 
-PACKED_CHUNK_LAYOUT_SCHEMA_VERSION = 1
+PACKED_CHUNK_LAYOUT_SCHEMA_VERSION = 2
 _PACKED_TOPOLOGY_CACHE_MAX_ENTRIES = 16
 _PACKED_TOPOLOGY_CACHE: OrderedDict[tuple[Any, ...], object] = OrderedDict()
 
@@ -293,6 +293,9 @@ class PackedBlockSparseMask:
     ) -> torch.Tensor:
         """Diagnostic/test-only dense materializer matching build_chunkwise_causal_mask."""
 
+        if self.layout.sparse_packing != "batch_padded":
+            raise ValueError("The sequential dense reference is only defined for batch_padded layouts.")
+
         batch_size = int(text_attention_masks[0].shape[0])
         dense = torch.zeros(
             batch_size,
@@ -333,6 +336,13 @@ def _layout_local_index_tensor(layout: PackedChunkLayout, *, device: torch.devic
     return torch.tensor(layout.local_token_index, device=device, dtype=torch.long)
 
 
+def _layout_chunk_ordinal_tensor(layout: PackedChunkLayout, *, device: torch.device | str) -> torch.Tensor:
+    ordinals = torch.empty(layout.total_token_count, device=device, dtype=torch.long)
+    for segment in layout.segments:
+        ordinals[segment.local_start : segment.local_end] = int(segment.chunk_ordinal)
+    return ordinals
+
+
 def _build_structural_mask_mod(
     layout: PackedChunkLayout,
     *,
@@ -347,6 +357,7 @@ def _build_structural_mask_mod(
     owner = _layout_owner_tensor(layout, device=device)
     role = _layout_role_tensor(layout, device=device)
     local_index = _layout_local_index_tensor(layout, device=device)
+    chunk_ordinal = _layout_chunk_ordinal_tensor(layout, device=device)
     padding_id = _ROLE_ID["padding"]
     text_id = _ROLE_ID["text"]
     observation_id = _ROLE_ID["observation"]
@@ -386,9 +397,34 @@ def _build_structural_mask_mod(
             & (key_role == padding_id)
             & (local_index[query_index] == local_index[key_index])
         )
-        return same_pattern & (
-            (query_not_padding & key_not_padding & allowed_local) | padding_self
+        if layout.sparse_packing == "batch_padded":
+            return same_pattern & (
+                (query_not_padding & key_not_padding & allowed_local) | padding_self
+            )
+
+        # DreamZero teacher-forcing topology. Each segment retains its own
+        # timestep-conditioned representation, while canonical instruction and
+        # clean-observation keys are shared across chunk segments. Dynamic validity
+        # selects segment 0's instruction and segment i's newly introduced O_i.
+        key_owner = owner[key_index]
+        query_chunk = chunk_ordinal[query_index]
+        canonical_text_key = (key_role == text_id) & (key_owner == 0)
+        text_query = query_role == text_id
+        text_self = text_query & (key_role == text_id) & (query_index == key_index)
+        clean_history_key = observation_key & (observation_ordinal[key_index] <= query_chunk)
+        clean_query_allowed = observation_query & (canonical_text_key | clean_history_key)
+        current_allowed = query_current & (
+            canonical_text_key
+            | clean_history_key
+            | (same_pattern & key_current)
+            | (same_pattern & (key_role == text_id))
         )
+        instruction_allowed = text_query & canonical_text_key
+        return (
+            query_not_padding
+            & key_not_padding
+            & (instruction_allowed | text_self | clean_query_allowed | current_allowed)
+        ) | padding_self
 
     return mask_mod
 
@@ -442,16 +478,29 @@ def build_packed_block_sparse_mask(
     key_snapshot = key_valid.to(device=target_device, dtype=torch.bool).clone().detach()
     state_snapshot = None
     if state_positions is not None:
-        if state_positions.ndim != 1 or int(state_positions.shape[0]) != int(batch_size):
-            raise ValueError(f"`state_positions` must be [B], got {tuple(state_positions.shape)}.")
+        if state_positions.ndim not in (1, 2) or int(state_positions.shape[0]) != int(batch_size):
+            raise ValueError(f"`state_positions` must be [B] or [B,K], got {tuple(state_positions.shape)}.")
+        if state_positions.ndim == 2 and int(state_positions.shape[1]) != len(layout.segments):
+            raise ValueError(
+                "Packed cross-chunk state positions must have one column per segment; "
+                f"got {state_positions.shape[1]} for {len(layout.segments)} segments."
+            )
         state_snapshot = state_positions.to(device=target_device, dtype=torch.long).clone().detach()
         if bool(((state_snapshot < -1) | (state_snapshot >= seq_len)).any()):
             raise ValueError("Every packed state position must be -1 or inside the packed sequence.")
-        state_rows = torch.nonzero(state_snapshot >= 0, as_tuple=False).flatten()
-        if state_rows.numel() > 0:
-            state_columns = state_snapshot[state_rows]
-            key_snapshot[state_rows, state_columns] = False
-            query_snapshot[state_rows, state_columns] = True
+        if state_snapshot.ndim == 1:
+            state_rows = torch.nonzero(state_snapshot >= 0, as_tuple=False).flatten()
+            if state_rows.numel() > 0:
+                state_columns = state_snapshot[state_rows]
+                key_snapshot[state_rows, state_columns] = False
+                query_snapshot[state_rows, state_columns] = True
+        else:
+            state_entries = torch.nonzero(state_snapshot >= 0, as_tuple=False)
+            if state_entries.numel() > 0:
+                state_rows = state_entries[:, 0]
+                state_columns = state_snapshot[state_rows, state_entries[:, 1]]
+                key_snapshot[state_rows, state_columns] = False
+                query_snapshot[state_rows, state_columns] = True
 
     if create_block_mask_fn is None:
         from torch.nn.attention.flex_attention import create_block_mask as create_block_mask_fn
@@ -512,6 +561,7 @@ def packed_flex_attention(
     if mask.state_positions is not None:
         state_positions = mask.state_positions.to(device=query.device, dtype=torch.long)
     query_roles = _layout_role_tensor(mask.layout, device=query.device)
+    query_owners = _layout_owner_tensor(mask.layout, device=query.device)
     current_query_roles = (query_roles == _ROLE_ID["target"]) | (
         query_roles == _ROLE_ID["action"]
     )
@@ -520,7 +570,10 @@ def packed_flex_attention(
         query_is_valid = query_valid[batch, query_index]
         allowed = query_is_valid & key_valid[batch, key_index]
         if state_positions is not None:
-            state_position = state_positions[batch]
+            if state_positions.ndim == 1:
+                state_position = state_positions[batch]
+            else:
+                state_position = state_positions[batch, query_owners[query_index]]
             has_state = state_position >= 0
             query_is_state = has_state & (query_index == state_position)
             current_to_state = (

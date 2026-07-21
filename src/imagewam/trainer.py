@@ -14,6 +14,7 @@ from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
+from .chunkwise import PACKED_CHUNK_LAYOUT_SCHEMA_VERSION
 from .utils.fs import ensure_dir
 from .utils.logging_config import get_logger
 from .utils.pytorch_utils import set_global_seed
@@ -497,11 +498,11 @@ class Wan22Trainer:
             "chunkwise_enabled": bool(chunkwise_enabled),
             "cache_type": cache_type,
             "forward_mode": str(getattr(model, "chunkwise_forward_mode", "sequential")),
-            "sparse_packing": str(getattr(model, "chunkwise_sparse_packing", "batch_padded")),
+            "sparse_packing": str(getattr(model, "chunkwise_sparse_packing", "interleaved")),
             "sparse_block_size": int(getattr(model, "chunkwise_sparse_block_size", 128)),
             "sparse_alignment": str(getattr(model, "chunkwise_sparse_alignment", "none")),
             "packed_layout_schema_version": int(
-                getattr(model, "chunkwise_packed_layout_schema_version", 1)
+                getattr(model, "chunkwise_packed_layout_schema_version", PACKED_CHUNK_LAYOUT_SCHEMA_VERSION)
             ),
             "torch_major_minor": torch_major_minor,
             "supports_chunkwise_training_losses": bool(

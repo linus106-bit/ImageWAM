@@ -143,7 +143,7 @@ class ImageWAM(torch.nn.Module):
             "loss_reduction": "mean",
             "cache_type": "observation_prefix",
             "forward_mode": "sequential",
-            "sparse_packing": "batch_padded",
+            "sparse_packing": "interleaved",
             "sparse_block_size": 128,
             "sparse_alignment": "none",
             "packed_layout_schema_version": PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
@@ -3100,6 +3100,135 @@ class ImageWAM(torch.nn.Module):
             return first
         raise TypeError(f"Unsupported packed payload leaf type: {type(first).__name__}.")
 
+    def _training_loss_flux2_chunkwise_interleaved(
+        self,
+        *,
+        inputs: dict[str, Any],
+        pattern_records: Sequence[dict[str, Any]],
+        observation_lengths: tuple[int, ...],
+        target_length: int,
+        action_length: int,
+        text_length: int,
+    ):
+        """DreamZero-style teacher forcing with direct cross-chunk attention edges."""
+
+        if str(getattr(self, "chunkwise_sparse_alignment", "none")) != "none":
+            raise RuntimeError("DreamZero interleaved packing currently requires sparse_alignment='none'.")
+        layout = build_packed_chunk_layout(
+            chunks=tuple(
+                {
+                    "text_length": int(text_length),
+                    "observation_token_lengths": observation_lengths[: index + 1],
+                    "target_length": int(target_length),
+                    "action_length": int(action_length),
+                    "chunk_ordinal": index,
+                }
+                for index in range(len(pattern_records))
+            ),
+            sparse_packing="interleaved",
+            sparse_alignment="none",
+            sparse_block_size=int(getattr(self, "chunkwise_sparse_block_size", 128)),
+        )
+
+        query_valid_segments = []
+        key_valid_segments = []
+        state_position_columns = []
+        has_state = [record["state_positions"] is not None for record in pattern_records]
+        if any(has_state) and not all(has_state):
+            raise RuntimeError("Cross-chunk packing requires state anchors for every chunk or none.")
+
+        for index, (record, segment) in enumerate(zip(pattern_records, layout.segments, strict=True)):
+            batch_size = int(record["batch_size"])
+            context_mask = record["context_mask"].to(device=self.device, dtype=torch.bool)
+            if index == 0:
+                text_query = context_mask.clone()
+                text_key = context_mask.clone()
+            else:
+                text_query = torch.zeros_like(context_mask)
+                text_key = torch.zeros_like(context_mask)
+
+            prefix_length = int(record["prefix_length"])
+            clean_query = torch.zeros(batch_size, prefix_length, device=self.device, dtype=torch.bool)
+            clean_key = torch.zeros_like(clean_query)
+            newest_start = sum(observation_lengths[:index])
+            newest_end = newest_start + int(observation_lengths[index])
+            newest_valid = inputs["observation_valid"][:, index].to(device=self.device, dtype=torch.bool)
+            clean_query[:, newest_start:newest_end] = True
+            clean_key[:, newest_start:newest_end] = newest_valid[:, None]
+
+            target_query = torch.ones(batch_size, int(target_length), device=self.device, dtype=torch.bool)
+            target_key = inputs["target_valid"][:, index].to(device=self.device, dtype=torch.bool)[:, None].expand(
+                batch_size, int(target_length)
+            )
+            action_query = torch.ones(batch_size, int(action_length), device=self.device, dtype=torch.bool)
+            action_key = ~record["action_is_pad"].to(device=self.device, dtype=torch.bool)
+            query_valid_segments.append(torch.cat([text_query, clean_query, target_query, action_query], dim=1))
+            key_valid_segments.append(torch.cat([text_key, clean_key, target_key, action_key], dim=1))
+            if record["state_positions"] is not None:
+                state_position_columns.append(
+                    record["state_positions"].to(device=self.device, dtype=torch.long) + int(segment.local_start)
+                )
+
+        query_valid = torch.cat(query_valid_segments, dim=1)
+        key_valid = torch.cat(key_valid_segments, dim=1)
+        state_positions = torch.stack(state_position_columns, dim=1) if state_position_columns else None
+        sparse_mask = build_packed_block_sparse_mask(
+            layout=layout,
+            query_valid=query_valid,
+            key_valid=key_valid,
+            state_positions=state_positions,
+            device=self.device,
+            num_heads=int(getattr(self.mot, "num_heads", 1)),
+        )
+        packed_outputs = self.mot.forward_flux2_interleaved(
+            video_pre_states=[record["video_pre"] for record in pattern_records],
+            action_pre_states=[record["action_pre"] for record in pattern_records],
+            attention_mask={"double_joint": sparse_mask, "single": sparse_mask},
+        )
+
+        loss_total = None
+        aggregate_metrics: dict[str, Any] = {
+            "loss_video": 0.0,
+            "loss_action": 0.0,
+            "chunk_count": 0.0,
+            "packed/sparse_packing": 2.0,
+            "packed/cross_chunk_edges": 1.0,
+            "packed/attention_sequence_length": float(layout.total_token_count),
+        }
+        for record, packed_output in zip(pattern_records, packed_outputs, strict=True):
+            chunk_index = int(record["chunk_index"])
+            pred_video = self.video_expert.post_dit(packed_output["video"], record["video_pre"])
+            pred_action = self.action_expert.post_dit(packed_output["action"], record["action_pre"])
+            video_squared_error = F.mse_loss(pred_video.float(), record["target_video"].float(), reduction="none")
+            action_squared_error = F.mse_loss(pred_action.float(), record["target_action"].float(), reduction="none")
+            action_valid = (~record["action_is_pad"])[:, :, None] & (~inputs["action_dim_is_pad"])[:, None, :]
+            action_squared_error = action_squared_error * action_valid.to(
+                device=action_squared_error.device, dtype=action_squared_error.dtype
+            )
+            loss, components = chunkwise_loss_contribution(
+                video_squared_error=video_squared_error,
+                action_squared_error=action_squared_error,
+                valid_target=inputs["target_valid"][:, chunk_index],
+                video_weight=self.train_video_scheduler.training_weight(record["timestep_video"]),
+                action_weight=self.train_action_scheduler.training_weight(record["timestep_action"]),
+                video_denominator=inputs["video_denominator"],
+                action_denominator=inputs["action_denominator"],
+                lambda_video=self.loss_lambda_video,
+                lambda_action=self.loss_lambda_action,
+            )
+            loss_total = loss if loss_total is None else loss_total + loss
+            loss_video = components["loss_video"]
+            loss_action = components["loss_action"]
+            aggregate_metrics["loss_video"] += loss_video
+            aggregate_metrics["loss_action"] += loss_action
+            aggregate_metrics["chunk_count"] += 1.0
+            aggregate_metrics[f"chunk/{chunk_index}/loss_video"] = loss_video
+            aggregate_metrics[f"chunk/{chunk_index}/loss_action"] = loss_action
+            aggregate_metrics[f"chunk/{chunk_index}/observation_prefix_tokens"] = float(record["prefix_length"])
+            aggregate_metrics[f"chunk/{chunk_index}/attention_sequence_length"] = float(layout.total_token_count)
+        assert loss_total is not None
+        return loss_total, aggregate_metrics
+
     def _training_loss_flux2_chunkwise_packed(self, inputs: dict[str, Any]):
         if not bool(getattr(self, "supports_chunkwise_prepared_forward", False)):
             raise RuntimeError(
@@ -3107,11 +3236,9 @@ class ImageWAM(torch.nn.Module):
             )
         if str(getattr(self, "chunkwise_forward_mode", "sequential")) != "packed_flex":
             raise RuntimeError("Packed chunkwise forward requires `forward_mode=packed_flex`.")
-        if str(getattr(self, "chunkwise_sparse_packing", "batch_padded")) != "batch_padded":
-            raise RuntimeError(
-                "G003 implements the selected `batch_padded` packed MoT vertical slice; "
-                f"got sparse_packing={getattr(self, 'chunkwise_sparse_packing', None)!r}."
-            )
+        sparse_packing = str(getattr(self, "chunkwise_sparse_packing", "interleaved"))
+        if sparse_packing not in {"interleaved", "batch_padded"}:
+            raise RuntimeError(f"Unsupported sparse packing {sparse_packing!r}.")
         self._validate_flux2_chunkwise_prepared_inputs(inputs)
 
         observations = inputs["observations"]
@@ -3189,9 +3316,9 @@ class ImageWAM(torch.nn.Module):
             action_length = current_action_length if action_length is None else action_length
             text_length = current_text_length if text_length is None else text_length
             if current_target_length != int(target_length) or current_action_length != int(action_length):
-                raise ValueError("Packed chunkwise batch_padded requires uniform target/action lengths.")
+                raise ValueError("Packed chunkwise execution requires uniform target/action lengths.")
             if current_text_length != int(text_length):
-                raise ValueError("Packed chunkwise batch_padded requires uniform text sequence length.")
+                raise ValueError("Packed chunkwise execution requires uniform text sequence length.")
 
             pattern_records.append(
                 {
@@ -3211,6 +3338,15 @@ class ImageWAM(torch.nn.Module):
             )
 
         assert target_length is not None and action_length is not None and text_length is not None
+        if sparse_packing == "interleaved":
+            return self._training_loss_flux2_chunkwise_interleaved(
+                inputs=inputs,
+                pattern_records=pattern_records,
+                observation_lengths=observation_lengths,
+                target_length=int(target_length),
+                action_length=int(action_length),
+                text_length=int(text_length),
+            )
         packed_video_pres = []
         packed_action_pres = []
         query_valid_rows = []

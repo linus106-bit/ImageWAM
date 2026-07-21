@@ -136,6 +136,7 @@ class _ActionExpert(nn.Module):
 class _Mot(nn.Module):
     def __init__(self):
         super().__init__()
+        self.num_heads = 1
         self.scale = nn.Parameter(torch.tensor(1.0))
         self.masks = []
 
@@ -152,6 +153,19 @@ class _Mot(nn.Module):
             "action": embeds_all["action"] * self.scale,
         }
 
+    def forward_flux2_interleaved(self, *, video_pre_states, action_pre_states, attention_mask):
+        self.masks.append(attention_mask["double_joint"])
+        return [
+            {
+                "video": {
+                    "txt": video_pre["tokens"]["txt"] * self.scale,
+                    "img": video_pre["tokens"]["img"] * self.scale,
+                },
+                "action": action_pre["tokens"] * self.scale,
+            }
+            for video_pre, action_pre in zip(video_pre_states, action_pre_states, strict=True)
+        ]
+
 
 def _raise_legacy_training_loss(*_args, **_kwargs):
     raise AssertionError("chunkwise forward must not call legacy training_loss")
@@ -165,7 +179,7 @@ def _chunkwise_forward_contract_model(input_scale=1.0):
     model.resolved_actions_per_chunk = 1
     model.resolved_total_action_horizon = 2
     model.chunkwise_forward_mode = "sequential"
-    model.chunkwise_sparse_packing = "batch_padded"
+    model.chunkwise_sparse_packing = "interleaved"
     model.chunkwise_sparse_alignment = "none"
     model.chunkwise_sparse_block_size = 128
     model.proprio_encoder = None
@@ -397,7 +411,7 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
             chunkwise_causal={"enabled": True, "num_chunks": 4},
         )
         self.assertEqual(sequential.chunkwise_forward_mode, "sequential")
-        self.assertEqual(sequential.chunkwise_sparse_packing, "batch_padded")
+        self.assertEqual(sequential.chunkwise_sparse_packing, "interleaved")
         self.assertEqual(sequential.chunkwise_sparse_block_size, 128)
         self.assertEqual(sequential.chunkwise_sparse_alignment, "none")
         self.assertTrue(sequential.chunkwise_packed_capability["supported"])
@@ -717,7 +731,7 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         valid = {**prepared, "proprio": torch.zeros(1, 2, 3)}
         model._validate_flux2_chunkwise_prepared_inputs(valid)
 
-    def test_packed_forward_matches_sequential_outputs_gradients_and_batch_padded_ownership(self):
+    def test_packed_forward_matches_sequential_and_builds_interleaved_ownership(self):
         def run_model(forward_mode):
             model = _chunkwise_forward_contract_model()
             model.chunkwise_forward_mode = forward_mode
@@ -752,7 +766,11 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
                 with mock.patch("imagewam.models.backbones.imagewam.torch.randn_like", side_effect=fake_randn_like), mock.patch(
                     "imagewam.models.backbones.imagewam.build_packed_block_sparse_mask", side_effect=fake_sparse_mask
                 ) as sparse_builder:
-                    with mock.patch.object(model.mot, "forward", wraps=model.mot.forward) as mot_forward:
+                    with mock.patch.object(
+                        model.mot,
+                        "forward_flux2_interleaved",
+                        wraps=model.mot.forward_flux2_interleaved,
+                    ) as mot_forward:
                         loss, metrics = model(prepared_chunkwise_inputs=prepared)
                 self.assertEqual(sparse_builder.call_count, 1)
                 self.assertEqual(mot_forward.call_count, 1)
@@ -856,20 +874,18 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
 
         self.assertIsNotNone(captured)
         layout = captured["layout"]
-        self.assertEqual(layout.sparse_packing, "batch_padded")
-        self.assertEqual(layout.total_token_count, 6)
+        self.assertEqual(layout.sparse_packing, "interleaved")
+        self.assertEqual(layout.total_token_count, 11)
         self.assertEqual(
             captured["query_valid"].tolist(),
             [
-                [True, True, True, False, True, True],
-                [True, True, True, True, True, True],
+                [True, True, True, True, True, False, False, False, True, True, True],
             ],
         )
         self.assertEqual(
             captured["key_valid"].tolist(),
             [
-                [True, True, True, False, True, True],
-                [True, True, True, False, False, False],
+                [True, True, True, True, True, False, False, False, False, False, False],
             ],
         )
 
