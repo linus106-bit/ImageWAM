@@ -73,7 +73,10 @@ class Flux2ChunkwiseTest(unittest.TestCase):
         self.assertFalse(mask[o0, o1].any())
         self.assertTrue(mask[o1, o0].all() and mask[o1, o1].all())
         self.assertTrue(mask[target, o0].all() and mask[target, o1].all())
-        self.assertTrue(mask[action, target].all())
+        self.assertTrue(mask[target, target].all())
+        self.assertTrue(mask[10, 10])
+        self.assertFalse(mask[target, action].any())
+        self.assertFalse(mask[action, target].any())
         self.assertEqual(mask[2].sum().item(), 1)
         self.assertTrue(mask[2, 2])
         self.assertFalse(mask[:, 3].any())  # padded text key
@@ -217,15 +220,17 @@ class Flux2ChunkwiseTest(unittest.TestCase):
                 )
             )
 
-        # Segment 1 target/action directly read canonical instruction and O0..O1.
+        # Segment 1 target/action read canonical instruction and O0..O1.
         for query_index in (9, 10):
             self.assertTrue(allowed(query_index, 0))
             self.assertTrue(allowed(query_index, 2))
             self.assertTrue(allowed(query_index, 8))
-            self.assertTrue(allowed(query_index, 9))
-            self.assertTrue(allowed(query_index, 10))
             self.assertFalse(allowed(query_index, 3))
             self.assertFalse(allowed(query_index, 4))
+        self.assertTrue(allowed(9, 9))
+        self.assertFalse(allowed(9, 10))
+        self.assertTrue(allowed(10, 10))
+        self.assertFalse(allowed(10, 9))
 
         # Clean O1 reads earlier clean history, but O0 cannot see future O1.
         self.assertTrue(allowed(8, 0))
@@ -352,9 +357,12 @@ class Flux2ChunkwiseTest(unittest.TestCase):
         self.assertEqual(calls[0]["KV_LEN"], layout.total_token_count)
         self.assertEqual(calls[0]["BLOCK_SIZE"], 4)
         self.assertEqual(sparse.block_mask, {"block_mask": 1})
-        # Structural predicate is token-exact inside partial blocks: current target/action are joint.
+        # Structural predicate keeps target-image noise and action noise isolated.
         mask_mod = calls[0]["mask_mod"]
-        self.assertTrue(bool(mask_mod(torch.tensor(0), torch.tensor(0), torch.tensor(6), torch.tensor(7))))
+        self.assertTrue(bool(mask_mod(torch.tensor(0), torch.tensor(0), torch.tensor(5), torch.tensor(6))))
+        self.assertTrue(bool(mask_mod(torch.tensor(0), torch.tensor(0), torch.tensor(7), torch.tensor(7))))
+        self.assertFalse(bool(mask_mod(torch.tensor(0), torch.tensor(0), torch.tensor(6), torch.tensor(7))))
+        self.assertFalse(bool(mask_mod(torch.tensor(0), torch.tensor(0), torch.tensor(7), torch.tensor(6))))
 
         aligned_layout = build_packed_chunk_layout(
             chunks=(

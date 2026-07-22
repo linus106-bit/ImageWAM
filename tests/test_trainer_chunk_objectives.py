@@ -112,7 +112,7 @@ def _chunk_model(losses=(1.0, 2.0, 3.0, 4.0), **overrides):
         "chunkwise_sparse_packing": "interleaved",
         "chunkwise_sparse_block_size": 128,
         "chunkwise_sparse_alignment": "none",
-        "chunkwise_packed_layout_schema_version": 2,
+        "chunkwise_packed_layout_schema_version": 3,
         "chunkwise_packed_capability": {"supported": True},
         "prepared_samples": [],
     }
@@ -366,7 +366,7 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
             self.assertEqual(payload["sparse_packing"], "interleaved")
             self.assertEqual(payload["sparse_block_size"], 128)
             self.assertEqual(payload["sparse_alignment"], "none")
-            self.assertEqual(payload["packed_layout_schema_version"], 2)
+            self.assertEqual(payload["packed_layout_schema_version"], 3)
             self.assertIn("torch_major_minor", payload)
             self.assertIs(payload["supports_chunkwise_training_losses"], True)
             trainer._validate_resume_chunkwise_metadata(payload, tmp_dir)

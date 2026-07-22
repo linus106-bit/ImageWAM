@@ -157,8 +157,8 @@ Chunk `i`에서 허용되는 attention 관계:
 |---|---|
 | Valid instruction | valid instruction |
 | Clean `Oj` | valid instruction + `O0 ... Oj` |
-| Noisy target `O(i+1)` | valid instruction + `O0 ... Oi` + current target/action/state |
-| Current action `Ai` | valid instruction + `O0 ... Oi` + current target/action/state |
+| Noisy target `O(i+1)` | valid instruction + `O0 ... Oi` + current target/state |
+| Current action `Ai` | valid instruction + `O0 ... Oi` + current action/state |
 | Current state `Si` | 자기 자신 |
 
 Future observation/action은 mask로만 숨기지 말고 chunk 입력 tensor에서 물리적으로 제외한다.
@@ -208,7 +208,7 @@ loss, metrics = prepared_model(prepared_chunkwise_inputs=prepared)
 accelerator.backward(loss)
 ```
 
-현재 선택된 packing은 DreamZero-style `interleaved`다. 각 chunk는 독립적인 diffusion timestep/AdaLN conditioning으로 Q/K/V를 만든 뒤 sequence 축으로 합쳐지고, 모든 MoT layer는 ImageWAM 소유 `PackedBlockSparseMask`를 통해 한 번 호출된다. Chunk `i`의 noisy target/action은 canonical instruction, clean observation `O0..Oi`, 같은 chunk의 target/action/state에만 접근한다. Clean `Oi`는 instruction과 `O0..Oi`에만 접근하고 state query는 self-only다. 중복 prefix token은 physical segment에는 남지만 dynamic validity가 canonical key만 선택한다. Cached topology는 structural layout만 보유하고, 현재 batch의 query/key validity와 chunk별 state position은 매 forward immutable snapshot으로 전달한다. Production packed path는 dense `[B,L,L]` mask를 만들지 않는다.
+현재 선택된 packing은 DreamZero-style `interleaved`다. 각 chunk는 독립적인 diffusion timestep/AdaLN conditioning으로 Q/K/V를 만든 뒤 sequence 축으로 합쳐지고, 모든 MoT layer는 ImageWAM 소유 `PackedBlockSparseMask`를 통해 한 번 호출된다. Chunk `i`의 noisy target과 action은 canonical instruction과 clean observation `O0..Oi`를 공유하지만, ImageWAM 방식대로 target-image noise와 action noise 사이의 직접 edge는 양방향 차단한다. 각 modality는 자신의 current block과 state만 볼 수 있다. Clean `Oi`는 instruction과 `O0..Oi`에만 접근하고 state query는 self-only다. 중복 prefix token은 physical segment에는 남지만 dynamic validity가 canonical key만 선택한다. Cached topology는 structural layout만 보유하고, 현재 batch의 query/key validity와 chunk별 state position은 매 forward immutable snapshot으로 전달한다. Production packed path는 dense `[B,L,L]` mask를 만들지 않는다.
 
 | Mode | Outer forward / logical microbatch | Backward | 용도 |
 |---|---:|---:|---|

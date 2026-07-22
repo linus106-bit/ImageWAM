@@ -6,7 +6,7 @@ from typing import Any, Callable, Literal, Sequence
 
 import torch
 
-PACKED_CHUNK_LAYOUT_SCHEMA_VERSION = 2
+PACKED_CHUNK_LAYOUT_SCHEMA_VERSION = 3
 _PACKED_TOPOLOGY_CACHE_MAX_ENTRIES = 16
 _PACKED_TOPOLOGY_CACHE: OrderedDict[tuple[Any, ...], object] = OrderedDict()
 
@@ -386,12 +386,12 @@ def _build_structural_mask_mod(
         )
         observation_to_text = observation_query & (key_role == text_id)
         query_current = (query_role == target_id) | (query_role == action_id)
-        key_current = (key_role == target_id) | (key_role == action_id)
-        current_joint = query_current & key_current
+        current_same_modality = (
+            ((query_role == target_id) & (key_role == target_id))
+            | ((query_role == action_id) & (key_role == action_id))
+        )
         current_to_prefix = query_current & ((key_role == text_id) | observation_key)
-        # Conservative fallback for unknown future roles while preserving current local order.
-        local_causal = local_index[key_index] <= local_index[query_index]
-        allowed_local = text_pair | observation_to_text | observation_causal | current_to_prefix | current_joint | local_causal
+        allowed_local = text_pair | observation_to_text | observation_causal | current_to_prefix | current_same_modality
         padding_self = (
             (query_role == padding_id)
             & (key_role == padding_id)
@@ -416,7 +416,7 @@ def _build_structural_mask_mod(
         current_allowed = query_current & (
             canonical_text_key
             | clean_history_key
-            | (same_pattern & key_current)
+            | (same_pattern & current_same_modality)
             | (same_pattern & (key_role == text_id))
         )
         instruction_allowed = text_query & canonical_text_key
@@ -734,14 +734,16 @@ def build_chunkwise_causal_mask(
         mask[:, cursor:end, observation_start:end] = True
         cursor = end
 
-    # The current noisy target and action form one current-chunk group.
+    # Target-image noise and action noise share the prefix but not each other.
     current_start = target_start
     mask[:, current_start:total_length, :text_length] = text_valid[:, None, :]
-    mask[:, current_start:total_length, observation_start:total_length] = True
+    mask[:, current_start:total_length, observation_start:target_start] = True
+    mask[:, target_start:action_start, target_start:action_start] = True
+    mask[:, action_start:total_length, action_start:total_length] = True
 
     if state_positions is not None:
         batch_indices = torch.arange(batch_size, device=device)
-        # Current target/action may condition on the state anchor; the state query itself is self-only.
+        # Both modalities may condition on state; target/action remain mutually isolated.
         mask[batch_indices[:, None], torch.arange(current_start, total_length, device=device), state_positions[:, None]] = True
         mask[batch_indices, state_positions] = False
         mask[batch_indices, state_positions, state_positions] = True

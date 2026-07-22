@@ -46,7 +46,7 @@ def _completed_result(task_config: str, candidate: str) -> dict:
             "sparse_packing": "interleaved",
             "sparse_block_size": 128,
             "sparse_alignment": "none",
-            "layout_schema_version": 2,
+            "layout_schema_version": 3,
         },
         "runtime": {
             "torch": "2.7.1",
@@ -168,7 +168,7 @@ class BenchmarkProtocolTests(unittest.TestCase):
                 self.assertEqual(spec["gradient_accumulation_steps"], expected_accumulation)
                 self.assertEqual(spec["forward_mode_default"], "sequential")
                 self.assertEqual(spec["sparse_packing"], "interleaved")
-                self.assertEqual(spec["layout_schema_version"], 2)
+                self.assertEqual(spec["layout_schema_version"], 3)
 
 
 class BenchmarkResultTests(unittest.TestCase):
