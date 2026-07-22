@@ -26,6 +26,17 @@ from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 logger = get_logger(__name__)
 
 
+FLUX2_CHUNKWISE_ROPE_SCHEMES = frozenset(
+    {
+        "current",
+        "chronological_image",
+        "temporal_action",
+        "chronological_full",
+        "no_chunk_time",
+    }
+)
+
+
 class ImageWAM(torch.nn.Module):
     """MoT world model with video/action experts."""
 
@@ -120,6 +131,7 @@ class ImageWAM(torch.nn.Module):
         self.chunkwise_sparse_packing = str(chunkwise["sparse_packing"])
         self.chunkwise_sparse_block_size = int(chunkwise["sparse_block_size"])
         self.chunkwise_sparse_alignment = str(chunkwise["sparse_alignment"])
+        self.chunkwise_rope_scheme = str(chunkwise["rope_scheme"])
         self.chunkwise_packed_layout_schema_version = int(chunkwise["packed_layout_schema_version"])
         self.chunkwise_packed_capability = self._validate_chunkwise_forward_capability(chunkwise)
         self.supports_chunkwise_training_losses = (
@@ -146,6 +158,7 @@ class ImageWAM(torch.nn.Module):
             "sparse_packing": "interleaved",
             "sparse_block_size": 128,
             "sparse_alignment": "none",
+            "rope_scheme": "current",
             "packed_layout_schema_version": PACKED_CHUNK_LAYOUT_SCHEMA_VERSION,
         }
         if config is not None:
@@ -164,6 +177,7 @@ class ImageWAM(torch.nn.Module):
         resolved["sparse_packing"] = str(resolved["sparse_packing"])
         resolved["sparse_block_size"] = int(resolved["sparse_block_size"])
         resolved["sparse_alignment"] = str(resolved["sparse_alignment"])
+        resolved["rope_scheme"] = str(resolved["rope_scheme"])
         resolved["packed_layout_schema_version"] = int(resolved["packed_layout_schema_version"])
         if resolved["num_chunks"] < 1:
             raise ValueError("`chunkwise_causal.num_chunks` must be >= 1.")
@@ -190,6 +204,11 @@ class ImageWAM(torch.nn.Module):
             )
         if resolved["sparse_block_size"] <= 0:
             raise ValueError("`chunkwise_causal.sparse_block_size` must be positive.")
+        if resolved["rope_scheme"] not in FLUX2_CHUNKWISE_ROPE_SCHEMES:
+            raise ValueError(
+                "`chunkwise_causal.rope_scheme` must be one of "
+                f"{sorted(FLUX2_CHUNKWISE_ROPE_SCHEMES)}, got {resolved['rope_scheme']!r}."
+            )
         if resolved["packed_layout_schema_version"] != PACKED_CHUNK_LAYOUT_SCHEMA_VERSION:
             raise ValueError(
                 "`chunkwise_causal.packed_layout_schema_version` is incompatible: "
@@ -2051,19 +2070,72 @@ class ImageWAM(torch.nn.Module):
         *,
         ordinal: int,
         role: str,
+        rope_scheme: str = "current",
     ) -> torch.Tensor:
         if int(ordinal) < 0:
             raise ValueError(f"`ordinal` must be non-negative, got {ordinal}.")
         role_key = str(role).strip().lower()
+        scheme = str(rope_scheme).strip().lower()
+        if scheme not in FLUX2_CHUNKWISE_ROPE_SCHEMES:
+            raise ValueError(
+                f"Unsupported FLUX chunkwise RoPE scheme: {rope_scheme!r}."
+            )
         if role_key == "clean":
-            time_value = 10.0 + float(ordinal)
+            if scheme in {"chronological_image", "chronological_full"}:
+                time_value = float(ordinal)
+            elif scheme == "no_chunk_time":
+                time_value = 10.0
+            else:
+                time_value = 10.0 + float(ordinal)
         elif role_key in {"noisy", "target"}:
-            time_value = float(ordinal)
+            time_value = 0.0 if scheme == "no_chunk_time" else float(ordinal)
         else:
             raise ValueError(f"Unsupported FLUX image-ID role: {role!r}")
         ordered = image_ids.clone()
         ordered[..., 0] = time_value
         return ordered
+
+    def _flux2_chunk_action_ids(
+        self,
+        action_tokens: torch.Tensor,
+        *,
+        chunk_index: int,
+    ) -> torch.Tensor:
+        scheme = str(getattr(self, "chunkwise_rope_scheme", "current"))
+        if scheme in {"temporal_action", "chronological_full"}:
+            position_offset = int(chunk_index) * int(self.resolved_actions_per_chunk)
+        else:
+            position_offset = 0
+        return self.action_expert.build_action_ids(
+            int(action_tokens.shape[0]),
+            int(action_tokens.shape[1]),
+            device=action_tokens.device,
+            dtype=action_tokens.dtype,
+            position_offset=position_offset,
+        )
+
+    def _flux2_inference_image_ids_like(
+        self,
+        image_ids: torch.Tensor,
+        *,
+        role: str,
+    ) -> torch.Tensor:
+        """Map one-step rollout IDs to the training scheme's first transition."""
+
+        scheme = str(getattr(self, "chunkwise_rope_scheme", "current"))
+        role_key = str(role).strip().lower()
+        if role_key == "clean":
+            ordinal = 0
+        elif role_key in {"noisy", "target"}:
+            ordinal = 1
+        else:
+            raise ValueError(f"Unsupported FLUX inference image-ID role: {role!r}")
+        return self._flux2_ordered_ids_like(
+            image_ids,
+            ordinal=ordinal,
+            role=role_key,
+            rope_scheme=scheme,
+        )
 
     @torch.no_grad()
     def prepare_chunkwise_training_inputs(
@@ -2158,10 +2230,16 @@ class ImageWAM(torch.nn.Module):
                 {
                     "tokens": tokens,
                     "clean_ids": self._flux2_ordered_ids_like(
-                        base_ids, ordinal=ordinal, role="clean"
+                        base_ids,
+                        ordinal=ordinal,
+                        role="clean",
+                        rope_scheme=getattr(self, "chunkwise_rope_scheme", "current"),
                     ),
                     "target_ids": self._flux2_ordered_ids_like(
-                        base_ids, ordinal=ordinal, role="target"
+                        base_ids,
+                        ordinal=ordinal,
+                        role="target",
+                        rope_scheme=getattr(self, "chunkwise_rope_scheme", "current"),
                     ),
                 }
             )
@@ -2933,6 +3011,10 @@ class ImageWAM(torch.nn.Module):
             timestep=self._scheduler_timestep_to_unit(
                 timestep_action, self.train_action_scheduler
             ),
+            position_ids=self._flux2_chunk_action_ids(
+                noisy_action,
+                chunk_index=chunk_index,
+            ),
         )
         attention_mask = build_chunkwise_causal_mask(
             text_attention_mask=video_pre["text_mask"],
@@ -3304,6 +3386,10 @@ class ImageWAM(torch.nn.Module):
                 action_tokens=noisy_action,
                 timestep=self._scheduler_timestep_to_unit(
                     timestep_action, self.train_action_scheduler
+                ),
+                position_ids=self._flux2_chunk_action_ids(
+                    noisy_action,
+                    chunk_index=chunk_index,
                 ),
             )
 
@@ -4669,6 +4755,7 @@ class ImageWAM(torch.nn.Module):
             )
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         ref_tokens, ref_img_ids = self._encode_flux2_image_tokens(input_image, time_value=10.0)
+        ref_img_ids = self._flux2_inference_image_ids_like(ref_img_ids, role="clean")
         batch_size = int(ref_tokens.shape[0])
         empty_target = ref_tokens.new_zeros(batch_size, 0, ref_tokens.shape[-1])
         empty_target_ids = ref_img_ids.new_zeros(batch_size, 0, ref_img_ids.shape[-1])
@@ -4742,6 +4829,10 @@ class ImageWAM(torch.nn.Module):
             action_pre = self.action_expert.pre_dit(
                 action_tokens=latents_action,
                 timestep=self._scheduler_timestep_to_unit(timestep_action, self.infer_action_scheduler),
+                position_ids=self._flux2_chunk_action_ids(
+                    latents_action,
+                    chunk_index=0,
+                ),
             )
             action_tokens = self.mot.forward_action_with_video_cache(
                 action_tokens=action_pre["tokens"],
@@ -4851,6 +4942,7 @@ class ImageWAM(torch.nn.Module):
             )
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         ref_tokens, ref_img_ids = self._encode_flux2_image_tokens(input_image, time_value=10.0)
+        ref_img_ids = self._flux2_inference_image_ids_like(ref_img_ids, role="clean")
         batch_size = int(ref_tokens.shape[0])
         latent_h = int(height) // 16
         latent_w = int(width) // 16
@@ -4870,6 +4962,7 @@ class ImageWAM(torch.nn.Module):
             device=self.device,
             dtype=self.torch_dtype,
         )
+        target_img_ids = self._flux2_inference_image_ids_like(target_img_ids, role="target")
 
         infer_timesteps, infer_deltas = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -5511,6 +5604,7 @@ class ImageWAM(torch.nn.Module):
             "mot": mot_state,
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "rope_scheme": str(getattr(self, "chunkwise_rope_scheme", "current")),
         }
         if checkpoint_format != "full":
             payload["checkpoint_format"] = checkpoint_format
@@ -5524,6 +5618,18 @@ class ImageWAM(torch.nn.Module):
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
         logger.info("Loading ImageWAM checkpoint from %s with payload keys=%s step=%s", path, sorted(payload.keys()), payload.get("step"))
+        checkpoint_rope_scheme = payload.get("rope_scheme")
+        current_rope_scheme = str(getattr(self, "chunkwise_rope_scheme", "current"))
+        if checkpoint_rope_scheme is not None and str(checkpoint_rope_scheme) != current_rope_scheme:
+            raise ValueError(
+                "Checkpoint RoPE scheme mismatch: "
+                f"checkpoint={checkpoint_rope_scheme!r}, current={current_rope_scheme!r}, path={path}."
+            )
+        if checkpoint_rope_scheme is None and self.stack == "flux2":
+            logger.warning(
+                "Checkpoint %s has no RoPE scheme metadata; treating it as a legacy checkpoint.",
+                path,
+            )
         if "mot" in payload:
             mot_state = payload["mot"]
             if self.stack == "flux2":

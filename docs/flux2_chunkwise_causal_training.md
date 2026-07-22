@@ -309,6 +309,7 @@ optimizer.step 한 번
 - `sparse_packing`
 - `sparse_block_size`
 - `sparse_alignment`
+- `rope_scheme`
 - `packed_layout_schema_version`
 - PyTorch major/minor
 
@@ -447,3 +448,75 @@ Runner environment contract:
 | CUDA + PyTorch FlexAttention | 지원 | opt-in |
 | raw DDP / Accelerate / DeepSpeed ZeRO 0-2 | 지원 | capability 검증 후 지원 |
 | FSDP / Megatron / ZeRO-3 | 거부 | 거부 |
+
+## 11. GPU 서버 RoPE ablation
+
+`model.chunkwise_causal.rope_scheme`은 mask와 packed layout을 고정한 채 semantic
+position ID만 바꾼다.
+
+| Scheme | Clean/target image time axis | Action position axis |
+|---|---|---|
+| `current` | clean `10+j`, target `j` | chunk마다 `0..A-1` |
+| `chronological_image` | clean/target 모두 `j` | chunk마다 `0..A-1` |
+| `temporal_action` | `current`와 동일 | 전역 `i*A..(i+1)*A-1` |
+| `chronological_full` | chronological image | global action |
+| `no_chunk_time` | clean `10`, target `0` | chunk마다 `0..A-1` |
+
+서버 환경 변수(`DATA_ROOT`, `FLUX2_SRC`, `FLUX2_AE_MODEL_PATH`와 checkpoint
+경로)를 설정한 뒤 먼저 짧은 smoke run을 수행한다.
+
+```bash
+python scripts/flux2/run_rope_ablation.py \
+  --schemes current,chronological_full \
+  --seeds 42 \
+  --gpus-per-run 8 \
+  --devices 0,1,2,3,4,5,6,7 \
+  --max-steps 20 \
+  --eval-every 10 \
+  --eval-num-samples 2 \
+  --output-root runs/rope_ablation/smoke
+```
+
+Smoke가 끝나면 동일한 checkpoint/data 조건으로 전체 후보와 seed를 실행한다.
+
+```bash
+python scripts/flux2/run_rope_ablation.py \
+  --task-type robotwin \
+  --flux2-variant 4b \
+  --seeds 42,43,44 \
+  --gpus-per-run 8 \
+  --devices 0,1,2,3,4,5,6,7 \
+  --max-steps 1000 \
+  --eval-every 100 \
+  --eval-num-samples 32 \
+  --output-root runs/rope_ablation/4b_main
+```
+
+추가 Hydra override는 반복 가능한 `--override`로 전달한다.
+
+```bash
+  --override batch_size=4 \
+  --override gradient_accumulation_steps=2
+```
+
+각 run은 `launcher.log`, `run.json`, resolved `config.yaml`, checkpoint를 독립적으로
+저장한다. 실험 루트에는 commit/명령을 담은 `manifest.json`, seed별
+`summary.csv`, scheme별 평균/표준편차인 `aggregate.csv`, 동일 seed를 current와
+짝지은 bootstrap 95% CI인 `paired_comparisons.csv`가 생성된다. 중단된 sweep은
+같은 `--output-root`와 `--skip-completed`를 사용해 완료된 run을 건너뛸 수 있다.
+Paired seed가 3개 미만이면 CI 기반 우열을 내리지 않고 `insufficient`로 기록한다.
+
+Rollout success-rate 평가에서는 학습 run과 같은 scheme을 반드시 전달한다.
+
+```bash
+ROPE_SCHEME=chronological_full \
+EXP_PATH=runs/rope_ablation/4b_main/chronological_full/seed_42 \
+EVAL_TRAIN_STEP=1000 \
+bash scripts/flux2/run_eval_flux2_robotwin.sh
+```
+
+One-step rollout은 학습의 첫 transition과 동일하게 noisy target time `1`을 사용한다.
+Clean observation은 `current`/`temporal_action`에서 `10`, chronological 후보에서 `0`,
+`no_chunk_time`에서 `10`이다. `no_chunk_time`의 target만 negative control 정의에 따라
+time `0`을 유지한다. 새 weight checkpoint에는 scheme이 기록되므로 다른
+`ROPE_SCHEME`으로 로드하면 즉시 실패한다.

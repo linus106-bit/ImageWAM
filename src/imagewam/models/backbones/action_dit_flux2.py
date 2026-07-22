@@ -240,10 +240,14 @@ class ActionDiTFlux2(nn.Module):
         *,
         device: torch.device,
         dtype: torch.dtype,
+        position_offset: int = 0,
     ) -> torch.Tensor:
         ids = torch.zeros(batch_size, seq_len, 4, device=device, dtype=dtype)
         ids[..., 0] = 2.0
-        ids[..., 1] = torch.arange(seq_len, device=device, dtype=dtype)[None, :]
+        ids[..., 1] = (
+            torch.arange(seq_len, device=device, dtype=dtype)[None, :]
+            + int(position_offset)
+        )
         return ids
 
     def pre_dit(
@@ -252,6 +256,7 @@ class ActionDiTFlux2(nn.Module):
         timestep: torch.Tensor,
         context: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> Dict[str, Any]:
         del context, context_mask
         if action_tokens.ndim != 3:
@@ -274,7 +279,20 @@ class ActionDiTFlux2(nn.Module):
         vec = self.time_in(timestep_embedding(timestep, 256)).to(dtype=tokens.dtype)
         double_mod_img = self.double_stream_modulation_img(vec)
         single_mod, _ = self.single_stream_modulation(vec)
-        ids = self.build_action_ids(batch_size, seq_len, device=tokens.device, dtype=tokens.dtype)
+        if position_ids is None:
+            ids = self.build_action_ids(
+                batch_size,
+                seq_len,
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )
+        else:
+            if tuple(position_ids.shape) != (batch_size, seq_len, 4):
+                raise ValueError(
+                    "`position_ids` must be [B,T,4], "
+                    f"got {tuple(position_ids.shape)} for action tokens {tuple(action_tokens.shape)}."
+                )
+            ids = position_ids.to(device=tokens.device, dtype=tokens.dtype)
         return {
             "tokens": tokens,
             "ids": ids,

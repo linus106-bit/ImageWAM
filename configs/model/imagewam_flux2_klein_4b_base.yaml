@@ -24,6 +24,7 @@ chunkwise_causal:
   sparse_packing: interleaved
   sparse_block_size: 128
   sparse_alignment: none
+  rope_scheme: current
 
 flux2_lora_config:
   enabled: false

@@ -366,6 +366,7 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
             self.assertEqual(payload["sparse_packing"], "interleaved")
             self.assertEqual(payload["sparse_block_size"], 128)
             self.assertEqual(payload["sparse_alignment"], "none")
+            self.assertEqual(payload["rope_scheme"], "current")
             self.assertEqual(payload["packed_layout_schema_version"], 3)
             self.assertIn("torch_major_minor", payload)
             self.assertIs(payload["supports_chunkwise_training_losses"], True)
@@ -393,6 +394,11 @@ class TrainerChunkObjectivesTest(unittest.TestCase):
         payload["forward_mode"] = "packed_flex"
         with self.assertRaisesRegex(ValueError, "forward_mode"):
             trainer._validate_resume_chunkwise_metadata(payload, "mode-mismatch")
+
+        payload = {**trainer._chunkwise_training_metadata(), "global_step": 1}
+        payload["rope_scheme"] = "chronological_full"
+        with self.assertRaisesRegex(ValueError, "rope_scheme"):
+            trainer._validate_resume_chunkwise_metadata(payload, "rope-mismatch")
 
         inconsistent = _chunk_model(chunkwise_causal_enabled=False)
         with self.assertRaisesRegex(ValueError, "Legacy full-state checkpoints can only resume with K=1"):

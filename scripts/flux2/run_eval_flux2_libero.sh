@@ -9,6 +9,7 @@ imagewam_init "${SCRIPT_DIR}/../.."
 SUITE="libero"
 CONFIG_NAME="sim_libero_omnigen2"
 FLUX2_VARIANT="${FLUX2_VARIANT:-4b}" # 4b | 9b
+ROPE_SCHEME="${ROPE_SCHEME:-current}"
 TASK="${TASK:-libero_flux2_klein_${FLUX2_VARIANT}_base_imagewam}"
 if [ "false" = "true" ]; then
   TASK="${TASK/_imagewam/_clean_imagewam}"
@@ -43,6 +44,7 @@ COMMON=(
   model.qwen3_model_spec="${FLUX2_QWEN3_MODEL_SPEC}"
   model.load_text_encoder=true
   model.pack_proprio_after_text=true
+  model.chunkwise_causal.rope_scheme="${ROPE_SCHEME}"
   MULTIRUN.num_gpus="${NUM_GPUS:-8}"
   MULTIRUN.max_tasks_per_gpu="${MAX_TASKS_PER_GPU:-4}"
   EVALUATION.action_horizon="${ACTION_HORIZON:-16}"
@@ -62,5 +64,5 @@ COMMON+=(
   MULTIRUN.chunk_size="${CHUNK_SIZE:-1}"
 )
 
-imagewam_print_config SUITE TASK CKPT_PATH DATASET_STATS_PATH FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH
+imagewam_print_config SUITE TASK ROPE_SCHEME CKPT_PATH DATASET_STATS_PATH FLUX2_SRC FLUX2_MODEL_PATH FLUX2_AE_MODEL_PATH
 imagewam_run imagewam_python experiments/libero/run_libero_manager.py "${COMMON[@]}" "$@"

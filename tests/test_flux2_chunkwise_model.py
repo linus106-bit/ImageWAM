@@ -120,11 +120,25 @@ class _VideoExpert(nn.Module):
 
 class _ActionExpert(nn.Module):
     @staticmethod
-    def pre_dit(action_tokens, **_kwargs):
+    def build_action_ids(batch_size, seq_len, *, device, dtype, position_offset=0):
+        ids = torch.zeros(batch_size, seq_len, 4, device=device, dtype=dtype)
+        ids[..., 0] = 2.0
+        ids[..., 1] = torch.arange(seq_len, device=device, dtype=dtype) + int(position_offset)
+        return ids
+
+    @staticmethod
+    def pre_dit(action_tokens, position_ids=None, **_kwargs):
         batch_size, seq_len = action_tokens.shape[:2]
+        if position_ids is None:
+            position_ids = _ActionExpert.build_action_ids(
+                batch_size,
+                seq_len,
+                device=action_tokens.device,
+                dtype=action_tokens.dtype,
+            )
         return {
             "tokens": action_tokens,
-            "ids": torch.zeros(batch_size, seq_len, 4),
+            "ids": position_ids,
             "t_mod": {},
         }
 
@@ -182,6 +196,7 @@ def _chunkwise_forward_contract_model(input_scale=1.0):
     model.chunkwise_sparse_packing = "interleaved"
     model.chunkwise_sparse_alignment = "none"
     model.chunkwise_sparse_block_size = 128
+    model.chunkwise_rope_scheme = "current"
     model.proprio_encoder = None
     model.supports_chunkwise_prepared_forward = True
     model.loss_lambda_video = 1.0
@@ -414,6 +429,7 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
         self.assertEqual(sequential.chunkwise_sparse_packing, "interleaved")
         self.assertEqual(sequential.chunkwise_sparse_block_size, 128)
         self.assertEqual(sequential.chunkwise_sparse_alignment, "none")
+        self.assertEqual(sequential.chunkwise_rope_scheme, "current")
         self.assertTrue(sequential.chunkwise_packed_capability["supported"])
 
         for bad_config, message in (
@@ -421,6 +437,7 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
             ({"sparse_packing": "auto"}, "sparse_packing"),
             ({"sparse_block_size": 0}, "sparse_block_size"),
             ({"sparse_alignment": "auto"}, "sparse_alignment"),
+            ({"rope_scheme": "unknown"}, "rope_scheme"),
             ({"packed_layout_schema_version": 999}, "packed_layout_schema_version"),
         ):
             config = {"enabled": True, "num_chunks": 4, **bad_config}
@@ -434,6 +451,70 @@ class Flux2ChunkwiseModelTest(unittest.TestCase):
                     stack="flux2",
                     chunkwise_causal=config,
                 )
+
+    def test_rope_schemes_preserve_spatial_ids_and_change_only_declared_axes(self):
+        base_ids = torch.tensor(
+            [[[99.0, 3.0, 7.0, 0.0], [99.0, 4.0, 8.0, 0.0]]]
+        )
+        expected_times = {
+            "current": (13.0, 3.0),
+            "chronological_image": (3.0, 3.0),
+            "temporal_action": (13.0, 3.0),
+            "chronological_full": (3.0, 3.0),
+            "no_chunk_time": (10.0, 0.0),
+        }
+        for scheme, (clean_time, target_time) in expected_times.items():
+            with self.subTest(scheme=scheme):
+                clean = ImageWAM._flux2_ordered_ids_like(
+                    base_ids,
+                    ordinal=3,
+                    role="clean",
+                    rope_scheme=scheme,
+                )
+                target = ImageWAM._flux2_ordered_ids_like(
+                    base_ids,
+                    ordinal=3,
+                    role="target",
+                    rope_scheme=scheme,
+                )
+                self.assertEqual(clean[..., 0].unique().item(), clean_time)
+                self.assertEqual(target[..., 0].unique().item(), target_time)
+                torch.testing.assert_close(clean[..., 1:], base_ids[..., 1:])
+                torch.testing.assert_close(target[..., 1:], base_ids[..., 1:])
+
+    def test_temporal_action_rope_uses_global_action_positions(self):
+        model = _bare_model()
+        model.action_expert = _ActionExpert()
+        model.resolved_actions_per_chunk = 4
+        action = torch.zeros(2, 4, 3)
+
+        model.chunkwise_rope_scheme = "current"
+        current = model._flux2_chunk_action_ids(action, chunk_index=2)
+        model.chunkwise_rope_scheme = "temporal_action"
+        temporal = model._flux2_chunk_action_ids(action, chunk_index=2)
+
+        self.assertEqual(current[0, :, 1].tolist(), [0.0, 1.0, 2.0, 3.0])
+        self.assertEqual(temporal[0, :, 1].tolist(), [8.0, 9.0, 10.0, 11.0])
+        self.assertTrue(torch.equal(current[..., 0], torch.full_like(current[..., 0], 2.0)))
+        self.assertTrue(torch.equal(temporal[..., 0], torch.full_like(temporal[..., 0], 2.0)))
+
+    def test_rollout_image_ids_match_first_transition_of_selected_scheme(self):
+        model = _bare_model()
+        base_ids = torch.zeros(1, 2, 4)
+        expected = {
+            "current": (10.0, 1.0),
+            "chronological_image": (0.0, 1.0),
+            "temporal_action": (10.0, 1.0),
+            "chronological_full": (0.0, 1.0),
+            "no_chunk_time": (10.0, 0.0),
+        }
+        for scheme, (clean_time, target_time) in expected.items():
+            with self.subTest(scheme=scheme):
+                model.chunkwise_rope_scheme = scheme
+                clean = model._flux2_inference_image_ids_like(base_ids, role="clean")
+                target = model._flux2_inference_image_ids_like(base_ids, role="target")
+                self.assertEqual(clean[..., 0].unique().item(), clean_time)
+                self.assertEqual(target[..., 0].unique().item(), target_time)
 
     def test_packed_flex_fails_fast_without_cuda_capability(self):
         with self.assertRaisesRegex(RuntimeError, "requires CUDA"):

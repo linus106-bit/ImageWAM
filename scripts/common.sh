@@ -61,7 +61,11 @@ imagewam_ckpt_from_exp() {
   if [ -z "${CKPT_PATH:-}" ]; then
     imagewam_require_env EXP_PATH
     imagewam_require_env EVAL_TRAIN_STEP
-    CKPT_PATH="${EXP_PATH}/checkpoints/weights/step_${EVAL_TRAIN_STEP}.pt"
+    local eval_step="${EVAL_TRAIN_STEP}"
+    if [[ "${eval_step}" =~ ^[0-9]+$ ]]; then
+      printf -v eval_step '%06d' "$((10#${eval_step}))"
+    fi
+    CKPT_PATH="${EXP_PATH}/checkpoints/weights/step_${eval_step}.pt"
     export CKPT_PATH
   fi
   if [ -z "${DATASET_STATS_PATH:-}" ] && [ -n "${EXP_PATH:-}" ]; then

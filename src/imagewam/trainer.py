@@ -198,6 +198,20 @@ class Wan22Trainer:
             return
         self.wandb_run.log(payload, step=self.global_step)
 
+    def _jsonl_log(self, phase: str, payload: dict):
+        path = os.environ.get("IMAGEWAM_METRICS_JSONL")
+        if not path or not self.accelerator.is_main_process:
+            return
+        record = {
+            "phase": str(phase),
+            "step": int(self.global_step),
+            **payload,
+        }
+        metrics_path = Path(path)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
     def _finish_wandb(self):
         if self.wandb_run is None:
             return
@@ -501,6 +515,7 @@ class Wan22Trainer:
             "sparse_packing": str(getattr(model, "chunkwise_sparse_packing", "interleaved")),
             "sparse_block_size": int(getattr(model, "chunkwise_sparse_block_size", 128)),
             "sparse_alignment": str(getattr(model, "chunkwise_sparse_alignment", "none")),
+            "rope_scheme": str(getattr(model, "chunkwise_rope_scheme", "current")),
             "packed_layout_schema_version": int(
                 getattr(model, "chunkwise_packed_layout_schema_version", PACKED_CHUNK_LAYOUT_SCHEMA_VERSION)
             ),
@@ -967,13 +982,28 @@ class Wan22Trainer:
                 proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
                 input_image = video0[:, 0].unsqueeze(0)
                 _, num_frames, _, _ = video0.shape
+                is_chunkwise_flux2 = (
+                    is_flux2_stack
+                    and bool(getattr(model, "chunkwise_causal_enabled", False))
+                    and int(getattr(model, "resolved_chunk_count", 1)) > 1
+                )
+                eval_action_horizon = sample["action_horizon"]
+                eval_target_frame_index = -1
+                eval_action_is_pad = sample.get("action_is_pad")
+                if is_chunkwise_flux2:
+                    eval_action_horizon = int(model.resolved_actions_per_chunk)
+                    eval_target_frame_index = 1
+                    if action is not None:
+                        action = action[:eval_action_horizon]
+                    if isinstance(eval_action_is_pad, torch.Tensor):
+                        eval_action_is_pad = eval_action_is_pad[:, :eval_action_horizon]
 
                 # 2. inference and video saving
                 infer_kwargs = {
                     "input_image": input_image,
                     "num_frames": num_frames,
                     "action": action,
-                    "action_horizon": sample["action_horizon"],
+                    "action_horizon": eval_action_horizon,
                     "proprio": proprio,
                     "text_cfg_scale": 1.0,
                     "action_cfg_scale": 1.0,
@@ -1003,7 +1033,12 @@ class Wan22Trainer:
                 pred_video_tensor = pil_frames_to_video_tensor(pred_video)
                 gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
                 if is_image_prediction_stack:
-                    gt_video_tensor = gt_video_tensor[:, -1:, :, :]
+                    if eval_target_frame_index < 0:
+                        gt_video_tensor = gt_video_tensor[:, -1:, :, :]
+                    else:
+                        gt_video_tensor = gt_video_tensor[
+                            :, eval_target_frame_index : eval_target_frame_index + 1, :, :
+                        ]
 
                 assert pred_video_tensor.shape == gt_video_tensor.shape, (
                     "Eval infer prediction/GT shape mismatch: "
@@ -1067,7 +1102,7 @@ class Wan22Trainer:
                         )
                     action_diff = pred_action_denorm - gt_action_denorm
                     action_valid = torch.ones_like(action_diff, dtype=torch.bool)
-                    action_is_pad = sample.get("action_is_pad")
+                    action_is_pad = eval_action_is_pad
                     if isinstance(action_is_pad, torch.Tensor):
                         if action_is_pad.ndim != 2 or action_is_pad.shape != action_diff.shape[:2]:
                             raise ValueError(
@@ -1105,7 +1140,7 @@ class Wan22Trainer:
                     vae_np = ((vae_image.detach().float().cpu().clamp(-1, 1) + 1.0) * 127.5).to(torch.uint8).permute(1, 2, 0).numpy()
                     vae_video_tensor = pil_frames_to_video_tensor([Image.fromarray(vae_np)])
                 elif is_flux2_stack:
-                    gt_final = video0[:, -1].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
+                    gt_final = video0[:, eval_target_frame_index].unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
                     vae_tokens, _ = model._encode_flux2_image_tokens(gt_final, time_value=0.0)
                     vae_image = model._decode_flux2_image_tokens(
                         vae_tokens,
@@ -1424,6 +1459,7 @@ class Wan22Trainer:
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
                         self._wandb_log(wandb_payload)
+                        self._jsonl_log("train", wandb_payload)
 
                     if should_log_timer and self.accelerator.is_main_process:
                         logger.info(
@@ -1467,6 +1503,7 @@ class Wan22Trainer:
                             if "action_l1" in metrics:
                                 eval_payload["eval/action_l1"] = float(metrics["action_l1"])
                             self._wandb_log(eval_payload)
+                            self._jsonl_log("eval", eval_payload)
 
                     if self.save_every > 0 and self.global_step % self.save_every == 0:
                         ckpt_info = self.save_checkpoint()
